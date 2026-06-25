@@ -1,13 +1,27 @@
 use dbx_core::connection::AppState;
+use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
+use crate::auth::AuthService;
+use crate::config::AppConfig;
+
+#[derive(Debug)]
 pub struct LoginRateLimit {
     pub fail_count: u32,
     pub locked_until: Option<std::time::Instant>,
+}
+
+impl Default for LoginRateLimit {
+    fn default() -> Self {
+        Self {
+            fail_count: 0,
+            locked_until: None,
+        }
+    }
 }
 
 pub struct WebState {
@@ -19,8 +33,10 @@ pub struct WebState {
     pub sse_channels: RwLock<HashMap<String, broadcast::Sender<String>>>,
     pub sql_file_executions: RwLock<HashMap<String, CancellationToken>>,
     pub login_rate_limit: Mutex<LoginRateLimit>,
-    /// Table export temp files: export_id -> (file_path, format)
     pub export_files: RwLock<HashMap<String, (String, String)>>,
+    pub pg_pool: PgPool,
+    pub auth_service: Option<Arc<AuthService>>,
+    pub config: Arc<AppConfig>,
 }
 
 impl WebState {

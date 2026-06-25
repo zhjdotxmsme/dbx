@@ -1,34 +1,40 @@
-services:
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-dbx}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_postgres}
-      POSTGRES_DB: ${POSTGRES_DB:-dbx}
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-dbx} -d ${POSTGRES_DB:-dbx}"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-      start_period: 10s
-    networks:
-      - dbx-network
-    deploy:
-      resources:
-        limits:
-          cpus: "1.0"
-          memory: 512M
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
+# DBX deployment using an existing external PostgreSQL.
+#
+# Use this file when PostgreSQL is already running in another Docker Compose
+# project on the same host and you want DBX to join that network.
+#
+# Prerequisite: the existing PostgreSQL must expose a Docker network named
+# "sonar" (or whatever you set via SONAR_NETWORK_NAME). In the example you
+# shared, that network is created by:
+#
+#   services:
+#     postgres:
+#       image: pgvector/pgvector:pg14
+#       container_name: postgres
+#       networks:
+#         - sonar
+#       ...
+#   networks:
+#     sonar:
+#       driver: bridge
+#
+# DBX joins the same network and reaches PostgreSQL as "postgres:5432".
+#
+# Usage:
+#   cp deploy/.env.example deploy/.env
+#   # edit deploy/.env:
+#   #   DBX_DATABASE_URL=postgresql://postgres:xmsme@123@postgres:5432/dbx
+#   #   DBX_LDAP_ENABLED=true   (optional)
+#   cd deploy
+#   docker compose -f docker-compose.external-postgres.yml up -d
+#
+# To use LDAP together with external PostgreSQL, keep the ldap service enabled
+# (default below) and set DBX_LDAP_ENABLED=true in your .env file.
 
+services:
   ldap:
     image: osixia/openldap:1.5.0
+    container_name: dbx-ldap
     environment:
       LDAP_ORGANISATION: ${LDAP_ORGANISATION:-DBX}
       LDAP_DOMAIN: ${LDAP_DOMAIN:-example.com}
@@ -63,18 +69,12 @@ services:
         max-file: "3"
 
   dbx:
-    # Use a pre-built image for quick start. Build from source if you need customizations.
     image: t8y2/dbx:latest
-    # Uncomment to build from source:
-    # build:
-    #   context: ..
-    #   dockerfile: deploy/Dockerfile
+    container_name: dbx
     ports:
       - "${DBX_PORT:-4224}:4224"
     environment:
-      # Database
-      DBX_DATABASE_URL: ${DBX_DATABASE_URL:-postgresql://dbx:changeme_postgres@postgres:5432/dbx}
-      # LDAP
+      DBX_DATABASE_URL: ${DBX_DATABASE_URL:-postgresql://postgres:xmsme@123@postgres:5432/dbx}
       DBX_LDAP_ENABLED: ${DBX_LDAP_ENABLED:-false}
       DBX_LDAP_URL: ${DBX_LDAP_URL:-ldap://ldap:389}
       DBX_LDAP_BIND_DN: ${DBX_LDAP_BIND_DN:-cn=admin,dc=example,dc=com}
@@ -83,24 +83,16 @@ services:
       DBX_LDAP_USER_SEARCH_BASE: ${DBX_LDAP_USER_SEARCH_BASE:-ou=users,dc=example,dc=com}
       DBX_LDAP_GROUP_SEARCH_BASE: ${DBX_LDAP_GROUP_SEARCH_BASE:-ou=groups,dc=example,dc=com}
       DBX_LDAP_USER_FILTER: ${DBX_LDAP_USER_FILTER:-(uid=%s)}
-      # LDAP TLS — mount certs to the paths below and set these to true
       DBX_LDAP_TLS_ENABLED: ${DBX_LDAP_TLS_ENABLED:-false}
       DBX_LDAP_TLS_INSECURE: ${DBX_LDAP_TLS_INSECURE:-false}
-      # Local auth fallback
       DBX_PASSWORD: ${DBX_PASSWORD:-changeme}
       DBX_JWT_SECRET: ${DBX_JWT_SECRET:-change_this_to_a_secure_random_string_min_32_chars}
-      # Server
       DBX_PORT: "4224"
       DBX_STATIC_DIR: /app/static
       DBX_DATA_DIR: /app/data
       DBX_MAX_UPLOAD_MB: ${DBX_MAX_UPLOAD_MB:-1024}
     volumes:
       - dbx-data:/app/data
-      # Uncomment to mount custom LDAP CA cert:
-      # - type: bind
-      #   source: ./ldap/ca.crt
-      #   target: /etc/ssl/certs/ldap-ca.crt
-      #   read_only: true
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "--spider", "http://localhost:4224/api/auth/check"]
@@ -109,12 +101,11 @@ services:
       retries: 10
       start_period: 30s
     depends_on:
-      postgres:
-        condition: service_healthy
       ldap:
         condition: service_healthy
     networks:
       - dbx-network
+      - ${SONAR_NETWORK_NAME:-sonar}
     deploy:
       resources:
         limits:
@@ -128,10 +119,12 @@ services:
 
 volumes:
   dbx-data:
-  postgres-data:
   ldap-data:
   ldap-config:
 
 networks:
   dbx-network:
     driver: bridge
+  sonar:
+    name: ${SONAR_NETWORK_NAME:-sonar}
+    external: true

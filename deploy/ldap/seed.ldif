@@ -1,0 +1,69 @@
+# Seed data for DBX demo LDAP directory
+# Applied by osixia/openldap on first boot via the custom LDIF bootstrap mechanism.
+#
+# Users authenticate with: uid=<username>, password as set below.
+# Group membership drives role mapping via the memberOf attribute (requires
+# the memberof overlay, enabled via LDAP_ADDITIONAL_SCHEMAS=memberof).
+
+dn: ou=users,dc=example,dc=com
+objectClass: organizationalUnit
+objectClass: top
+ou: users
+
+dn: ou=groups,dc=example,dc=com
+objectClass: organizationalUnit
+objectClass: top
+ou: groups
+
+# ── Users ──────────────────────────────────────────────────────────
+
+dn: uid=user01,ou=users,dc=example,dc=com
+objectClass: inetOrgPerson
+objectClass: top
+cn: User One
+sn: One
+uid: user01
+userPassword: user01
+mail: user01@example.com
+
+dn: uid=user02,ou=users,dc=example,dc=com
+objectClass: inetOrgPerson
+objectClass: top
+cn: User Two
+sn: Two
+uid: user02
+userPassword: user02
+mail: user02@example.com
+
+dn: uid=admin01,ou=users,dc=example,dc=com
+objectClass: inetOrgPerson
+objectClass: top
+cn: Admin One
+sn: Admin
+uid: admin01
+userPassword: admin01
+mail: admin01@example.com
+
+# ── Groups ─────────────────────────────────────────────────────────
+
+dn: cn=developers,ou=groups,dc=example,dc=com
+objectClass: groupOfNames
+objectClass: top
+cn: developers
+description: Developers with full edit access
+member: uid=user01,ou=users,dc=example,dc=com
+member: uid=user02,ou=users,dc=example,dc=com
+
+dn: cn=viewers,ou=groups,dc=example,dc=com
+objectClass: groupOfNames
+objectClass: top
+cn: viewers
+description: Read-only access
+member: uid=user01,ou=users,dc=example,dc=com
+
+dn: cn=admins,ou=groups,dc=example,dc=com
+objectClass: groupOfNames
+objectClass: top
+cn: admins
+description: Administrative access
+member: uid=admin01,ou=users,dc=example,dc=com
