@@ -86,6 +86,8 @@ services:
       # LDAP TLS — mount certs to the paths below and set these to true
       DBX_LDAP_TLS_ENABLED: ${DBX_LDAP_TLS_ENABLED:-false}
       DBX_LDAP_TLS_INSECURE: ${DBX_LDAP_TLS_INSECURE:-false}
+      # Set to true when deploying behind HTTPS so the session cookie gets Secure
+      DBX_SECURE_COOKIE: ${DBX_SECURE_COOKIE:-false}
       # Local auth fallback
       DBX_PASSWORD: ${DBX_PASSWORD:-changeme}
       DBX_JWT_SECRET: ${DBX_JWT_SECRET:-change_this_to_a_secure_random_string_min_32_chars}

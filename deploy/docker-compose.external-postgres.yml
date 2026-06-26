@@ -85,6 +85,7 @@ services:
       DBX_LDAP_USER_FILTER: ${DBX_LDAP_USER_FILTER:-(uid=%s)}
       DBX_LDAP_TLS_ENABLED: ${DBX_LDAP_TLS_ENABLED:-false}
       DBX_LDAP_TLS_INSECURE: ${DBX_LDAP_TLS_INSECURE:-false}
+      DBX_SECURE_COOKIE: ${DBX_SECURE_COOKIE:-false}
       DBX_PASSWORD: ${DBX_PASSWORD:-changeme}
       DBX_JWT_SECRET: ${DBX_JWT_SECRET:-change_this_to_a_secure_random_string_min_32_chars}
       DBX_PORT: "4224"
