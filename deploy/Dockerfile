@@ -78,9 +78,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-dejavu-core \
     libfreetype6 \
     libssl3 \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -r dbx && useradd -r -g dbx dbx \
+    && mkdir -p /app/data
 COPY --from=backend /out/${TARGETPLATFORM}/dbx-web /usr/local/bin/
 COPY --from=frontend /app/dist /app/static
+RUN chown -R dbx:dbx /app/data /app/static
+USER dbx
 ENV DBX_STATIC_DIR=/app/static
 ENV DBX_DATA_DIR=/app/data
 EXPOSE 4224
