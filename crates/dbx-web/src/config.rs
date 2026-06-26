@@ -60,6 +60,7 @@ pub struct ServerConfig {
     pub data_dir: Option<PathBuf>,
     pub static_dir: Option<PathBuf>,
     pub max_upload_mb: usize,
+    pub secure_cookie: bool,
 }
 
 impl Default for AppConfig {
@@ -88,6 +89,7 @@ impl Default for AppConfig {
                 data_dir: None,
                 static_dir: None,
                 max_upload_mb: 1024,
+                secure_cookie: false,
             },
         }
     }

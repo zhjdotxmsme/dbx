@@ -93,7 +93,8 @@ pub async fn login(
             let token = uuid::Uuid::new_v4().to_string();
             state.sessions.write().await.insert(token.clone());
 
-            let cookie = format!("dbx_session={token}; Path=/; HttpOnly; SameSite=Lax");
+            let secure_flag = if state.config.server.secure_cookie { "Secure; " } else { "" };
+            let cookie = format!("dbx_session={token}; Path=/; HttpOnly; {secure_flag}SameSite=Lax");
             return (
                 axum::http::StatusCode::OK,
                 [(axum::http::header::SET_COOKIE, cookie)],
@@ -119,7 +120,8 @@ pub async fn login(
                 .map(|p| p.to_string())
                 .collect();
 
-            let cookie = format!("dbx_session={session_token}; Path=/; HttpOnly; SameSite=Lax");
+            let secure_flag = if state.config.server.secure_cookie { "Secure; " } else { "" };
+            let cookie = format!("dbx_session={session_token}; Path=/; HttpOnly; {secure_flag}SameSite=Lax");
 
             (
                 axum::http::StatusCode::OK,
@@ -230,7 +232,8 @@ pub async fn setup(
     let token = uuid::Uuid::new_v4().to_string();
     state.sessions.write().await.insert(token.clone());
 
-    let cookie = format!("dbx_session={token}; Path=/; HttpOnly; SameSite=Lax");
+    let secure_flag = if state.config.server.secure_cookie { "Secure; " } else { "" };
+    let cookie = format!("dbx_session={token}; Path=/; HttpOnly; {secure_flag}SameSite=Lax");
     Ok((
         axum::http::StatusCode::OK,
         [(axum::http::header::SET_COOKIE, cookie)],
@@ -301,7 +304,8 @@ pub async fn change_password(
 }
 
 pub async fn logout(State(state): State<Arc<WebState>>) -> Response {
-    let cookie = "dbx_session=; Path=/; HttpOnly; Max-Age=0";
+    let secure_flag = if state.config.server.secure_cookie { "Secure; " } else { "" };
+    let cookie = format!("dbx_session=; Path=/; HttpOnly; {secure_flag}Max-Age=0");
     (
         axum::http::StatusCode::OK,
         [(axum::http::header::SET_COOKIE, cookie)],
