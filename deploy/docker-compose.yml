@@ -63,12 +63,9 @@ services:
         max-file: "3"
 
   dbx:
-    # Use a pre-built image for quick start. Build from source if you need customizations.
-    image: t8y2/dbx:latest
-    # Uncomment to build from source:
-    # build:
-    #   context: ..
-    #   dockerfile: deploy/Dockerfile
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
     ports:
       - "${DBX_PORT:-4224}:4224"
     environment:

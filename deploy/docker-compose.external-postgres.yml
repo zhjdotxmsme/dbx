@@ -69,7 +69,9 @@ services:
         max-file: "3"
 
   dbx:
-    image: t8y2/dbx:latest
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
     container_name: dbx
     ports:
       - "${DBX_PORT:-4224}:4224"
