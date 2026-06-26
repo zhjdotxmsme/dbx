@@ -126,6 +126,42 @@ impl UserRepository {
         Ok(roles)
     }
 
+    /// Returns roles that are mapped via ldap_group_dn for this user.
+    /// These are the roles that the sync function manages — only roles with
+    /// a non-null ldap_group_dn are considered LDAP-managed.
+    pub async fn get_user_ldap_roles(&self, user_id: Uuid) -> Result<Vec<Role>> {
+        let roles = sqlx::query_as!(
+            Role,
+            r#"
+            SELECT r.id, r.name, r.description, r.ldap_group_dn, r.created_at
+            FROM roles r
+            JOIN user_roles ur ON r.id = ur.role_id
+            WHERE ur.user_id = $1 AND r.ldap_group_dn IS NOT NULL
+            "#,
+            user_id
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(roles)
+    }
+
+    pub async fn remove_role_by_name(&self, user_id: Uuid, role_name: &str) -> Result<()> {
+        sqlx::query!(
+            r#"
+            DELETE FROM user_roles
+            WHERE user_id = $1
+              AND role_id = (SELECT id FROM roles WHERE name = $2)
+            "#,
+            user_id,
+            role_name
+        )
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     pub async fn get_user_permission_names(&self, user_id: Uuid) -> Result<Vec<String>> {
         let permissions = sqlx::query_scalar!(
             r#"

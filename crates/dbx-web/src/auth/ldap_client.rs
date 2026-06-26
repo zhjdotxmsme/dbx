@@ -57,6 +57,10 @@ impl bb8::ManageConnection for LdapConnectionManager {
         Ok(())
     }
 
+    /// bb8 calls this synchronously; ldap3 search is async so we cannot
+    /// perform a real liveness probe here. Instead, `is_valid` re-binds on
+    /// checkout and pool-level `idle_timeout` / `max_lifetime` recycle stale
+    /// connections periodically.
     fn has_broken(&self, _conn: &mut Self::Connection) -> bool {
         false
     }
@@ -79,8 +83,10 @@ impl LdapAuthClient {
 
         let pool = Pool::builder()
             .max_size(config.max_pool_size)
-            .min_idle(Some(2))
+            .min_idle(Some(1))
             .connection_timeout(Duration::from_secs(config.connect_timeout_secs))
+            .idle_timeout(Some(Duration::from_secs(60)))
+            .max_lifetime(Some(Duration::from_secs(300)))
             .build(manager)
             .await
             .context("Failed to create LDAP connection pool")?;
@@ -94,10 +100,13 @@ impl LdapAuthClient {
         debug!("Attempting LDAP authentication for user: {}", username);
 
         let escaped_username = ldap_escape(username);
-        let filter = self
-            .config
-            .user_filter_template
-            .replace("{username}", &escaped_username);
+        // Support both %s (OpenLDAP convention) and {username} template syntax.
+        // %s takes priority to match the default docker-compose configuration (uid=%s).
+        let filter = if self.config.user_filter_template.contains("%s") {
+            self.config.user_filter_template.replace("%s", &escaped_username)
+        } else {
+            self.config.user_filter_template.replace("{username}", &escaped_username)
+        };
 
         debug!("LDAP search filter: {}", filter);
 

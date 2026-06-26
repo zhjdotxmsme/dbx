@@ -208,11 +208,37 @@ impl AuthService {
         Ok(created_user)
     }
 
+    /// Full-sync LDAP group membership to DB roles.
+    ///
+    /// Computes the difference between the target roles (derived from the user's
+    /// current LDAP groups) and the current LDAP-mapped roles in the database,
+    /// then adds missing roles and removes stale ones. Non-LDAP roles are never
+    /// touched.
     async fn sync_user_roles_from_ldap_groups(&self, user_id: Uuid, groups: &[String]) -> Result<()> {
-        for group_dn in groups {
-            if let Some(role) = self.user_repo.find_role_by_ldap_group_dn(group_dn).await? {
-                self.user_repo.assign_role_by_name(user_id, &role.name).await?;
-            }
+        // Target: roles mapped from the user's current LDAP groups
+        let target_roles: HashSet<String> = groups
+            .iter()
+            .filter_map(|dn| self.user_repo.find_role_by_ldap_group_dn(dn).await.ok().flatten())
+            .map(|r| r.name)
+            .collect();
+
+        // Current: LDAP-mapped roles the user already has in the database
+        let current_roles: HashSet<String> = self
+            .user_repo
+            .get_user_ldap_roles(user_id)
+            .await?
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+
+        // Add new roles
+        for role in target_roles.difference(&current_roles) {
+            self.user_repo.assign_role_by_name(user_id, role).await?;
+        }
+
+        // Remove stale roles
+        for role in current_roles.difference(&target_roles) {
+            self.user_repo.remove_role_by_name(user_id, role).await?;
         }
 
         Ok(())
