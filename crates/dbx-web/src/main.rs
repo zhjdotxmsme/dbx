@@ -268,6 +268,7 @@ async fn main() {
         pg_pool: pg_pool.clone(),
         auth_service,
         config: config.clone(),
+        user_repo: crate::repositories::UserRepository::new(pg_pool.clone()),
     });
 
     // CORS
@@ -290,6 +291,12 @@ async fn main() {
         .route("/connection/close-database", post(routes::connection::close_database_connection))
         .route("/connection/save", post(routes::connection::save_connections))
         .route("/connection/list", get(routes::connection::load_connections))
+        .route("/role-connections/grant", post(routes::role_connections::grant))
+        .route("/role-connections/revoke", post(routes::role_connections::revoke))
+        .route("/role-connections/list", get(routes::role_connections::list_for_role))
+        .route("/users", get(routes::users::list_users))
+        .route("/users/{user_id}/roles", post(routes::users::assign_role))
+        .route("/users/{user_id}/roles/{role_name}", delete(routes::users::remove_role))
         .route("/plugins", get(routes::plugins::list_plugins))
         // JDBC
         .route("/jdbc/drivers", get(routes::jdbc::list_jdbc_drivers).post(routes::jdbc::import_jdbc_drivers))

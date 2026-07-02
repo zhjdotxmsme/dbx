@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::auth::AuthService;
 use crate::config::AppConfig;
+use crate::repositories::UserRepository;
 
 #[derive(Debug)]
 pub struct LoginRateLimit {
@@ -38,6 +39,7 @@ pub struct WebState {
     pub pg_pool: PgPool,
     pub auth_service: Option<Arc<AuthService>>,
     pub config: Arc<AppConfig>,
+    pub user_repo: UserRepository,
 }
 
 impl WebState {
