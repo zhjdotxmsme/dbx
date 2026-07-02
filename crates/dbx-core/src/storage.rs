@@ -520,14 +520,15 @@ fn delete_secret_prefix_in_tx(
 // History
 
 impl Storage {
-    pub async fn save_history_entry(&self, entry: &HistoryEntry) -> Result<(), String> {
-        let entry = entry.clone();
+    pub async fn save_history_entry(&self, entry: &HistoryEntry, session_user_id: &str) -> Result<(), String> {
+        let mut entry = entry.clone();
+        entry.user_id = session_user_id.to_string();
         self.with_conn(move |conn| {
             conn.execute(
                 "INSERT OR REPLACE INTO history \
                  (id, connection_name, database, sql_text, executed_at, execution_time_ms, success, error, \
-                  activity_kind, connection_id, operation, target, affected_rows, rollback_sql, details_json) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  activity_kind, connection_id, operation, target, affected_rows, rollback_sql, details_json, user_id) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     entry.id,
                     entry.connection_name,
@@ -543,7 +544,8 @@ impl Storage {
                     entry.target,
                     entry.affected_rows,
                     entry.rollback_sql,
-                    entry.details_json
+                    entry.details_json,
+                    entry.user_id,
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -561,10 +563,12 @@ impl Storage {
 
     pub async fn load_history_entries(
         &self,
+        user_id: Option<&str>,
         limit: usize,
         offset: usize,
         activity_kind: Option<String>,
     ) -> Result<Vec<HistoryEntry>, String> {
+        let user_id = user_id.map(|s| s.to_string());
         self.with_conn(move |conn| {
             let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<HistoryEntry> {
                 Ok(HistoryEntry {
@@ -586,33 +590,73 @@ impl Storage {
                     affected_rows: row.get(12)?,
                     rollback_sql: row.get(13)?,
                     details_json: row.get(14)?,
+                    user_id: row.get(15)?,
                 })
             };
 
-            if let Some(kind) = activity_kind {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT id, connection_name, database, sql_text, executed_at, execution_time_ms, success, \
-                         error, activity_kind, connection_id, operation, target, affected_rows, rollback_sql, details_json \
-                         FROM history WHERE activity_kind = ?1 ORDER BY executed_at DESC LIMIT ?2 OFFSET ?3",
-                    )
-                    .map_err(|e| e.to_string())?;
-                let rows = stmt
-                    .query_map(params![kind, limit as i64, offset as i64], map_row)
-                    .map_err(|e| e.to_string())?;
-                rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+            let columns = "id, connection_name, database, sql_text, executed_at, execution_time_ms, success, \
+                          error, activity_kind, connection_id, operation, target, affected_rows, rollback_sql, details_json, user_id";
+
+            if let Some(uid) = &user_id {
+                if let Some(kind) = activity_kind {
+                    let mut stmt = conn
+                        .prepare(
+                            &format!(
+                                "SELECT {columns} FROM history \
+                                 WHERE activity_kind = ?1 AND user_id = ?2 \
+                                 ORDER BY executed_at DESC LIMIT ?3 OFFSET ?4",
+                            ),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let rows = stmt
+                        .query_map(params![kind, uid, limit as i64, offset as i64], map_row)
+                        .map_err(|e| e.to_string())?;
+                    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+                } else {
+                    let mut stmt = conn
+                        .prepare(
+                            &format!(
+                                "SELECT {columns} FROM history \
+                                 WHERE user_id = ?1 \
+                                 ORDER BY executed_at DESC LIMIT ?2 OFFSET ?3",
+                            ),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let rows = stmt
+                        .query_map(params![uid, limit as i64, offset as i64], map_row)
+                        .map_err(|e| e.to_string())?;
+                    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+                }
             } else {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT id, connection_name, database, sql_text, executed_at, execution_time_ms, success, \
-                         error, activity_kind, connection_id, operation, target, affected_rows, rollback_sql, details_json \
-                         FROM history ORDER BY executed_at DESC LIMIT ?1 OFFSET ?2",
-                    )
-                    .map_err(|e| e.to_string())?;
-                let rows = stmt
-                    .query_map(params![limit as i64, offset as i64], map_row)
-                    .map_err(|e| e.to_string())?;
-                rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+                // No user_id filter — admin "see all" mode
+                if let Some(kind) = activity_kind {
+                    let mut stmt = conn
+                        .prepare(
+                            &format!(
+                                "SELECT {columns} FROM history \
+                                 WHERE activity_kind = ?1 \
+                                 ORDER BY executed_at DESC LIMIT ?2 OFFSET ?3",
+                            ),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let rows = stmt
+                        .query_map(params![kind, limit as i64, offset as i64], map_row)
+                        .map_err(|e| e.to_string())?;
+                    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+                } else {
+                    let mut stmt = conn
+                        .prepare(
+                            &format!(
+                                "SELECT {columns} FROM history \
+                                 ORDER BY executed_at DESC LIMIT ?1 OFFSET ?2",
+                            ),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let rows = stmt
+                        .query_map(params![limit as i64, offset as i64], map_row)
+                        .map_err(|e| e.to_string())?;
+                    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+                }
             }
         })
         .await
@@ -622,10 +666,13 @@ impl Storage {
         self.with_conn(|conn| conn.execute("DELETE FROM history", []).map(|_| ()).map_err(|e| e.to_string())).await
     }
 
-    pub async fn delete_history_entry(&self, id: &str) -> Result<(), String> {
+    pub async fn delete_history_entry(&self, id: &str, user_id: &str) -> Result<(), String> {
         let id = id.to_string();
+        let uid = user_id.to_string();
         self.with_conn(move |conn| {
-            conn.execute("DELETE FROM history WHERE id = ?1", [id]).map(|_| ()).map_err(|e| e.to_string())
+            conn.execute("DELETE FROM history WHERE id = ?1 AND user_id = ?2", params![id, uid])
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         })
         .await
     }
@@ -873,14 +920,15 @@ impl Storage {
 // AI Conversations
 
 impl Storage {
-    pub async fn save_ai_conversation(&self, conv: &AiConversation) -> Result<(), String> {
-        let conv = conv.clone();
+    pub async fn save_ai_conversation(&self, conv: &AiConversation, session_user_id: &str) -> Result<(), String> {
+        let mut conv = conv.clone();
+        conv.user_id = session_user_id.to_string();
         let messages_json = serde_json::to_string(&conv.messages).map_err(|e| e.to_string())?;
         self.with_conn(move |conn| {
             conn.execute(
                 "INSERT OR REPLACE INTO ai_conversations \
-                 (id, title, connection_name, database, messages_json, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                 (id, title, connection_name, database, messages_json, created_at, updated_at, user_id) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     conv.id,
                     conv.title,
@@ -888,7 +936,8 @@ impl Storage {
                     conv.database,
                     messages_json,
                     conv.created_at,
-                    conv.updated_at
+                    conv.updated_at,
+                    conv.user_id,
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -904,16 +953,18 @@ impl Storage {
         .await
     }
 
-    pub async fn load_ai_conversations(&self) -> Result<Vec<AiConversation>, String> {
-        self.with_conn(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, title, connection_name, database, messages_json, created_at, updated_at \
-                     FROM ai_conversations ORDER BY updated_at DESC",
-                )
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map([], |row| {
+    pub async fn load_ai_conversations(&self, user_id: Option<&str>) -> Result<Vec<AiConversation>, String> {
+        let user_id = user_id.map(|s| s.to_string());
+        self.with_conn(move |conn| {
+            let columns = "id, title, connection_name, database, messages_json, created_at, updated_at, user_id";
+            let sql = if let Some(ref uid) = user_id {
+                format!("SELECT {columns} FROM ai_conversations WHERE user_id = ?1 ORDER BY updated_at DESC")
+            } else {
+                format!("SELECT {columns} FROM ai_conversations ORDER BY updated_at DESC")
+            };
+            let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+            let rows = if let Some(uid) = &user_id {
+                stmt.query_map(params![uid], |row| {
                     let messages_json: String = row.get(4)?;
                     let messages: Vec<AiChatMessage> =
                         serde_json::from_str(&messages_json).map_err(map_from_sql_err)?;
@@ -925,18 +976,44 @@ impl Storage {
                         messages,
                         created_at: row.get(5)?,
                         updated_at: row.get(6)?,
+                        user_id: row.get(7)?,
                     })
                 })
-                .map_err(|e| e.to_string())?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())
+            } else {
+                stmt.query_map([], |row| {
+                    let messages_json: String = row.get(4)?;
+                    let messages: Vec<AiChatMessage> =
+                        serde_json::from_str(&messages_json).map_err(map_from_sql_err)?;
+                    Ok(AiConversation {
+                        id: row.get(0)?,
+                        title: row.get(1)?,
+                        connection_name: row.get(2)?,
+                        database: row.get(3)?,
+                        messages,
+                        created_at: row.get(5)?,
+                        updated_at: row.get(6)?,
+                        user_id: row.get(7)?,
+                    })
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())
+            }?;
+            Ok(rows)
         })
         .await
     }
 
-    pub async fn delete_ai_conversation(&self, id: &str) -> Result<(), String> {
+    pub async fn delete_ai_conversation(&self, id: &str, user_id: &str) -> Result<(), String> {
         let id = id.to_string();
+        let uid = user_id.to_string();
         self.with_conn(move |conn| {
-            conn.execute("DELETE FROM ai_conversations WHERE id = ?1", [id]).map(|_| ()).map_err(|e| e.to_string())
+            conn.execute("DELETE FROM ai_conversations WHERE id = ?1 AND user_id = ?2", params![id, uid])
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         })
         .await
     }
@@ -1251,144 +1328,186 @@ impl Storage {
         .await
     }
 
-    pub async fn load_saved_sql_library(&self) -> Result<SavedSqlLibrary, String> {
-        self.with_conn(|conn| {
-            let mut folder_stmt = conn
-                .prepare(
-                    "SELECT id, connection_id, parent_folder_id, name, order_index, created_at, updated_at \
-                     FROM saved_sql_folders ORDER BY COALESCE(parent_folder_id, ''), order_index, connection_id, name COLLATE NOCASE",
-                )
-                .map_err(|e| e.to_string())?;
-            let folders = folder_stmt
-                .query_map([], |row| {
+    pub async fn load_saved_sql_library(&self, user_id: Option<&str>) -> Result<SavedSqlLibrary, String> {
+        let user_id = user_id.map(|s| s.to_string());
+        self.with_conn(move |conn| {
+            let folder_cols = "id, connection_id, parent_folder_id, name, order_index, created_at, updated_at, user_id";
+            let folder_where = if user_id.is_some() {
+                " AND user_id = ?1".to_string()
+            } else {
+                String::new()
+            };
+            let mut folder_sql = format!(
+                "SELECT {folder_cols} FROM saved_sql_folders WHERE 1=1{folder_where} \
+                 ORDER BY COALESCE(parent_folder_id, ''), order_index, connection_id, name COLLATE NOCASE"
+            );
+            let mut folder_stmt = conn.prepare(&folder_sql).map_err(|e| e.to_string())?;
+            let folder_rows: Vec<SavedSqlFolder> = if let Some(ref uid) = user_id {
+                folder_stmt.query_map(params![uid], |row| {
                     Ok(SavedSqlFolder {
-                        id: row.get(0)?,
-                        connection_id: row.get(1)?,
-                        parent_folder_id: row.get(2)?,
-                        name: row.get(3)?,
-                        order_index: row.get(4)?,
-                        created_at: row.get(5)?,
-                        updated_at: row.get(6)?,
+                        id: row.get(0)?, connection_id: row.get(1)?,
+                        parent_folder_id: row.get(2)?, name: row.get(3)?,
+                        order_index: row.get(4)?, created_at: row.get(5)?,
+                        updated_at: row.get(6)?, user_id: row.get(7)?,
                     })
-                })
-                .map_err(|e| e.to_string())?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?;
+                }).map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+            } else {
+                folder_stmt.query_map([], |row| {
+                    Ok(SavedSqlFolder {
+                        id: row.get(0)?, connection_id: row.get(1)?,
+                        parent_folder_id: row.get(2)?, name: row.get(3)?,
+                        order_index: row.get(4)?, created_at: row.get(5)?,
+                        updated_at: row.get(6)?, user_id: row.get(7)?,
+                    })
+                }).map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+            };
 
-            let mut file_stmt = conn
-                .prepare(
-                    "SELECT id, connection_id, folder_id, name, database_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at \
-                     FROM saved_sql_files ORDER BY COALESCE(folder_id, ''), order_index, connection_id, name COLLATE NOCASE",
-                )
-                .map_err(|e| e.to_string())?;
-            let files = file_stmt
-                .query_map([], |row| {
+            let file_cols = "id, connection_id, folder_id, name, database_name, schema_name, sql_text, \
+                            order_index, open_count, opened_at, created_at, updated_at, user_id";
+            let file_where = if user_id.is_some() {
+                " AND user_id = ?1".to_string()
+            } else {
+                String::new()
+            };
+            let mut file_sql = format!(
+                "SELECT {file_cols} FROM saved_sql_files WHERE 1=1{file_where} \
+                 ORDER BY COALESCE(folder_id, ''), order_index, connection_id, name COLLATE NOCASE"
+            );
+            let mut file_stmt = conn.prepare(&file_sql).map_err(|e| e.to_string())?;
+            let files: Vec<SavedSqlFile> = if let Some(ref uid) = user_id {
+                file_stmt.query_map(params![uid], |row| {
                     Ok(SavedSqlFile {
-                        id: row.get(0)?,
-                        connection_id: row.get(1)?,
-                        folder_id: row.get(2)?,
-                        name: row.get(3)?,
-                        database: row.get(4)?,
-                        schema: row.get(5)?,
+                        id: row.get(0)?, connection_id: row.get(1)?,
+                        folder_id: row.get(2)?, name: row.get(3)?,
+                        database: row.get(4)?, schema: row.get(5)?,
                         sql: row.get(6)?,
                         sql_loaded: true,
-                        order_index: row.get(7)?,
-                        open_count: row.get(8)?,
-                        opened_at: row.get(9)?,
-                        created_at: row.get(10)?,
-                        updated_at: row.get(11)?,
+                        order_index: row.get(7)?, open_count: row.get(8)?,
+                        opened_at: row.get(9)?, created_at: row.get(10)?,
+                        updated_at: row.get(11)?, user_id: row.get(12)?,
                     })
-                })
-                .map_err(|e| e.to_string())?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?;
-
-            Ok(SavedSqlLibrary { folders, files })
-        })
-        .await
-    }
-
-    pub async fn load_saved_sql_library_summary(&self) -> Result<SavedSqlLibrary, String> {
-        self.with_conn(|conn| {
-            let mut folder_stmt = conn
-                .prepare(
-                    "SELECT id, connection_id, parent_folder_id, name, order_index, created_at, updated_at \
-                     FROM saved_sql_folders ORDER BY COALESCE(parent_folder_id, ''), order_index, connection_id, name COLLATE NOCASE",
-                )
-                .map_err(|e| e.to_string())?;
-            let folders = folder_stmt
-                .query_map([], |row| {
-                    Ok(SavedSqlFolder {
-                        id: row.get(0)?,
-                        connection_id: row.get(1)?,
-                        parent_folder_id: row.get(2)?,
-                        name: row.get(3)?,
-                        order_index: row.get(4)?,
-                        created_at: row.get(5)?,
-                        updated_at: row.get(6)?,
-                    })
-                })
-                .map_err(|e| e.to_string())?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?;
-
-            let mut file_stmt = conn
-                .prepare(
-                    "SELECT id, connection_id, folder_id, name, database_name, schema_name, order_index, open_count, opened_at, created_at, updated_at \
-                     FROM saved_sql_files ORDER BY COALESCE(folder_id, ''), order_index, connection_id, name COLLATE NOCASE",
-                )
-                .map_err(|e| e.to_string())?;
-            let files = file_stmt
-                .query_map([], |row| {
+                }).map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+            } else {
+                file_stmt.query_map([], |row| {
                     Ok(SavedSqlFile {
-                        id: row.get(0)?,
-                        connection_id: row.get(1)?,
-                        folder_id: row.get(2)?,
-                        name: row.get(3)?,
-                        database: row.get(4)?,
-                        schema: row.get(5)?,
-                        sql: String::new(),
-                        sql_loaded: false,
-                        order_index: row.get(6)?,
-                        open_count: row.get(7)?,
-                        opened_at: row.get(8)?,
-                        created_at: row.get(9)?,
-                        updated_at: row.get(10)?,
+                        id: row.get(0)?, connection_id: row.get(1)?,
+                        folder_id: row.get(2)?, name: row.get(3)?,
+                        database: row.get(4)?, schema: row.get(5)?,
+                        sql: row.get(6)?,
+                        sql_loaded: true,
+                        order_index: row.get(7)?, open_count: row.get(8)?,
+                        opened_at: row.get(9)?, created_at: row.get(10)?,
+                        updated_at: row.get(11)?, user_id: row.get(12)?,
                     })
-                })
-                .map_err(|e| e.to_string())?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?;
+                }).map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+            };
+
+            Ok(SavedSqlLibrary { folders: folder_rows, files })
+        })
+        .await
+    }
+
+    pub async fn load_saved_sql_library_summary(&self, user_id: Option<&str>) -> Result<SavedSqlLibrary, String> {
+        let user_id = user_id.map(|s| s.to_string());
+        self.with_conn(move |conn| {
+            let folder_cols = "id, connection_id, parent_folder_id, name, order_index, created_at, updated_at, user_id";
+            let folder_where = if user_id.is_some() {
+                " AND user_id = ?1".to_string()
+            } else { String::new() };
+            let mut folder_sql = format!(
+                "SELECT {folder_cols} FROM saved_sql_folders WHERE 1=1{folder_where} \
+                 ORDER BY COALESCE(parent_folder_id, ''), order_index, connection_id, name COLLATE NOCASE"
+            );
+            let mut folder_stmt = conn.prepare(&folder_sql).map_err(|e| e.to_string())?;
+            let folders: Vec<SavedSqlFolder> = if let Some(ref uid) = user_id {
+                folder_stmt.query_map(params![uid], |row| {
+                    Ok(SavedSqlFolder {
+                        id: row.get(0)?, connection_id: row.get(1)?,
+                        parent_folder_id: row.get(2)?, name: row.get(3)?,
+                        order_index: row.get(4)?, created_at: row.get(5)?,
+                        updated_at: row.get(6)?, user_id: row.get(7)?,
+                    })
+                }).map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+            } else {
+                folder_stmt.query_map([], |row| {
+                    Ok(SavedSqlFolder {
+                        id: row.get(0)?, connection_id: row.get(1)?,
+                        parent_folder_id: row.get(2)?, name: row.get(3)?,
+                        order_index: row.get(4)?, created_at: row.get(5)?,
+                        updated_at: row.get(6)?, user_id: row.get(7)?,
+                    })
+                }).map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+            };
+
+            let file_cols = "id, connection_id, folder_id, name, database_name, schema_name, \
+                            order_index, open_count, opened_at, created_at, updated_at, user_id";
+            let file_where = if user_id.is_some() {
+                " AND user_id = ?1".to_string()
+            } else { String::new() };
+            let mut file_sql = format!(
+                "SELECT {file_cols} FROM saved_sql_files WHERE 1=1{file_where} \
+                 ORDER BY COALESCE(folder_id, ''), order_index, connection_id, name COLLATE NOCASE"
+            );
+            let mut file_stmt = conn.prepare(&file_sql).map_err(|e| e.to_string())?;
+            let files: Vec<SavedSqlFile> = if let Some(ref uid) = user_id {
+                file_stmt.query_map(params![uid], |row| {
+                    Ok(SavedSqlFile {
+                        id: row.get(0)?, connection_id: row.get(1)?,
+                        folder_id: row.get(2)?, name: row.get(3)?,
+                        database: row.get(4)?, schema: row.get(5)?,
+                        sql: String::new(), sql_loaded: false,
+                        order_index: row.get(6)?, open_count: row.get(7)?,
+                        opened_at: row.get(8)?, created_at: row.get(9)?,
+                        updated_at: row.get(10)?, user_id: row.get(11)?,
+                    })
+                }).map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+            } else {
+                file_stmt.query_map([], |row| {
+                    Ok(SavedSqlFile {
+                        id: row.get(0)?, connection_id: row.get(1)?,
+                        folder_id: row.get(2)?, name: row.get(3)?,
+                        database: row.get(4)?, schema: row.get(5)?,
+                        sql: String::new(), sql_loaded: false,
+                        order_index: row.get(6)?, open_count: row.get(7)?,
+                        opened_at: row.get(8)?, created_at: row.get(9)?,
+                        updated_at: row.get(10)?, user_id: row.get(11)?,
+                    })
+                }).map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+            };
 
             Ok(SavedSqlLibrary { folders, files })
         })
         .await
     }
 
-    pub async fn load_saved_sql_file(&self, id: &str) -> Result<Option<SavedSqlFile>, String> {
+    pub async fn load_saved_sql_file(&self, id: &str, user_id: &str) -> Result<Option<SavedSqlFile>, String> {
         let id = id.to_string();
+        let uid = user_id.to_string();
         self.with_conn(move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, connection_id, folder_id, name, database_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at \
-                     FROM saved_sql_files WHERE id = ?1",
+                    "SELECT id, connection_id, folder_id, name, database_name, schema_name, sql_text, \
+                     order_index, open_count, opened_at, created_at, updated_at, user_id \
+                     FROM saved_sql_files WHERE id = ?1 AND user_id = ?2",
                 )
                 .map_err(|e| e.to_string())?;
-            match stmt.query_row([id], |row| {
+            match stmt.query_row(params![id, uid], |row| {
                 Ok(SavedSqlFile {
-                    id: row.get(0)?,
-                    connection_id: row.get(1)?,
-                    folder_id: row.get(2)?,
-                    name: row.get(3)?,
-                    database: row.get(4)?,
-                    schema: row.get(5)?,
-                    sql: row.get(6)?,
-                    sql_loaded: true,
-                    order_index: row.get(7)?,
-                    open_count: row.get(8)?,
-                    opened_at: row.get(9)?,
-                    created_at: row.get(10)?,
-                    updated_at: row.get(11)?,
+                    id: row.get(0)?, connection_id: row.get(1)?,
+                    folder_id: row.get(2)?, name: row.get(3)?,
+                    database: row.get(4)?, schema: row.get(5)?,
+                    sql: row.get(6)?, sql_loaded: true,
+                    order_index: row.get(7)?, open_count: row.get(8)?,
+                    opened_at: row.get(9)?, created_at: row.get(10)?,
+                    updated_at: row.get(11)?, user_id: row.get(12)?,
                 })
             }) {
                 Ok(file) => Ok(Some(file)),
@@ -1399,18 +1518,21 @@ impl Storage {
         .await
     }
 
-    pub async fn save_saved_sql_folder(&self, folder: &SavedSqlFolder) -> Result<(), String> {
-        let folder = folder.clone();
+    pub async fn save_saved_sql_folder(&self, folder: &SavedSqlFolder, session_user_id: &str) -> Result<(), String> {
+        let mut folder = folder.clone();
+        folder.user_id = session_user_id.to_string();
         self.with_conn(move |conn| {
             conn.execute(
-                "INSERT INTO saved_sql_folders (id, connection_id, parent_folder_id, name, order_index, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?) \
+                "INSERT INTO saved_sql_folders \
+                 (id, connection_id, parent_folder_id, name, order_index, created_at, updated_at, user_id) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT(id) DO UPDATE SET \
                  connection_id = excluded.connection_id, \
                  parent_folder_id = excluded.parent_folder_id, \
                  name = excluded.name, \
                  order_index = excluded.order_index, \
-                 updated_at = excluded.updated_at",
+                 updated_at = excluded.updated_at, \
+                 user_id = excluded.user_id",
                 params![
                     folder.id,
                     folder.connection_id,
@@ -1418,7 +1540,8 @@ impl Storage {
                     folder.name,
                     folder.order_index,
                     folder.created_at,
-                    folder.updated_at
+                    folder.updated_at,
+                    folder.user_id,
                 ],
             )
             .map(|_| ())
@@ -1427,8 +1550,9 @@ impl Storage {
         .await
     }
 
-    pub async fn delete_saved_sql_folder(&self, id: &str) -> Result<(), String> {
+    pub async fn delete_saved_sql_folder(&self, id: &str, user_id: &str) -> Result<(), String> {
         let id = id.to_string();
+        let uid = user_id.to_string();
         self.with_conn(move |conn| {
             let tx = conn.transaction().map_err(|e| e.to_string())?;
             let mut folder_ids = vec![id.clone()];
@@ -1436,10 +1560,10 @@ impl Storage {
             while index < folder_ids.len() {
                 let parent_id = folder_ids[index].clone();
                 let mut stmt = tx
-                    .prepare("SELECT id FROM saved_sql_folders WHERE parent_folder_id = ?1")
+                    .prepare("SELECT id FROM saved_sql_folders WHERE parent_folder_id = ?1 AND user_id = ?2")
                     .map_err(|e| e.to_string())?;
                 let child_ids = stmt
-                    .query_map([parent_id.as_str()], |row| row.get::<_, String>(0))
+                    .query_map(params![parent_id.as_str(), uid], |row| row.get::<_, String>(0))
                     .map_err(|e| e.to_string())?
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| e.to_string())?;
@@ -1447,9 +1571,9 @@ impl Storage {
                 index += 1;
             }
             for folder_id in folder_ids.iter().rev() {
-                tx.execute("DELETE FROM saved_sql_files WHERE folder_id = ?1", [folder_id.as_str()])
+                tx.execute("DELETE FROM saved_sql_files WHERE folder_id = ?1 AND user_id = ?2", params![folder_id.as_str(), uid])
                     .map_err(|e| e.to_string())?;
-                tx.execute("DELETE FROM saved_sql_folders WHERE id = ?1", [folder_id.as_str()])
+                tx.execute("DELETE FROM saved_sql_folders WHERE id = ?1 AND user_id = ?2", params![folder_id.as_str(), uid])
                     .map_err(|e| e.to_string())?;
             }
             tx.commit().map_err(|e| e.to_string())
@@ -1457,24 +1581,27 @@ impl Storage {
         .await
     }
 
-    pub async fn save_saved_sql_file(&self, file: &SavedSqlFile) -> Result<(), String> {
-        let file = file.clone();
+    pub async fn save_saved_sql_file(&self, file: &SavedSqlFile, session_user_id: &str) -> Result<(), String> {
+        let mut file = file.clone();
+        file.user_id = session_user_id.to_string();
         self.with_conn(move |conn| {
             conn.execute(
                 "INSERT INTO saved_sql_files \
-                 (id, connection_id, folder_id, name, database_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                 (id, connection_id, folder_id, name, database_name, schema_name, sql_text, \
+                  order_index, open_count, opened_at, created_at, updated_at, user_id) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT(id) DO UPDATE SET \
                  connection_id = excluded.connection_id, \
                  folder_id = excluded.folder_id, \
                  name = excluded.name, \
                  database_name = excluded.database_name, \
                  schema_name = excluded.schema_name, \
-                 sql_text = CASE WHEN ?13 THEN excluded.sql_text ELSE saved_sql_files.sql_text END, \
+                 sql_text = CASE WHEN ?14 THEN excluded.sql_text ELSE saved_sql_files.sql_text END, \
                  order_index = excluded.order_index, \
                  open_count = excluded.open_count, \
                  opened_at = excluded.opened_at, \
-                 updated_at = excluded.updated_at",
+                 updated_at = excluded.updated_at, \
+                 user_id = excluded.user_id",
                 params![
                     file.id,
                     file.connection_id,
@@ -1488,7 +1615,8 @@ impl Storage {
                     file.opened_at,
                     file.created_at,
                     file.updated_at,
-                    file.sql_loaded
+                    file.user_id,
+                    file.sql_loaded,
                 ],
             )
             .map(|_| ())
@@ -1497,10 +1625,26 @@ impl Storage {
         .await
     }
 
-    pub async fn delete_saved_sql_file(&self, id: &str) -> Result<(), String> {
+    pub async fn delete_saved_sql_file(&self, id: &str, user_id: &str) -> Result<(), String> {
         let id = id.to_string();
+        let uid = user_id.to_string();
         self.with_conn(move |conn| {
-            conn.execute("DELETE FROM saved_sql_files WHERE id = ?1", [id]).map(|_| ()).map_err(|e| e.to_string())
+            conn.execute("DELETE FROM saved_sql_files WHERE id = ?1 AND user_id = ?2", params![id, uid])
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    pub async fn list_all_connection_ids(&self) -> Result<Vec<String>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT id FROM connections").map_err(|e| e.to_string())?;
+            let ids = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(ids)
         })
         .await
     }
