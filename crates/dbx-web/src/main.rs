@@ -271,6 +271,34 @@ async fn main() {
         user_repo: crate::repositories::UserRepository::new(pg_pool.clone()),
     });
 
+    // Post-migration: grant existing SQLite connections to 'everyone' role
+    {
+        match web_state.user_repo.create_role_if_missing("everyone",
+            "Default role auto-granted during upgrade").await
+        {
+            Ok(role_id) => {
+                let conn_ids = match web_state.app.storage.list_all_connection_ids().await {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        tracing::warn!("Post-migration: failed to list connections: {}", e);
+                        Vec::new()
+                    }
+                };
+                if !conn_ids.is_empty() {
+                    for cid in &conn_ids {
+                        let _ = web_state.user_repo.grant_connection_to_role(
+                            role_id, cid, None,
+                        ).await;
+                    }
+                    tracing::info!("Post-migration: {} connections granted to 'everyone' role", conn_ids.len());
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Post-migration: failed to create 'everyone' role: {}", e);
+            }
+        }
+    }
+
     // CORS
     let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
 
