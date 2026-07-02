@@ -30,7 +30,7 @@ futures = "0.3"
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 tokio-util = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
-chrono = { version = "0.4", features = ["serde", "utc"] }
+chrono = { version = "0.4", features = ["serde", "clock"] }
 aes-gcm = "0.10"
 base64 = "0.22"
 pbkdf2 = "0.12"
@@ -42,7 +42,7 @@ bb8-ldap = "0.4"
 jsonwebtoken = "9"
 config = "0.15"
 dotenvy = "0.15"
-strum = { version = "0.26", features = ["derive", "display", "enum-string"] }
+strum = { version = "0.26", features = ["derive"] }
 anyhow = "1"
 thiserror = "2"
 once_cell = "1"
