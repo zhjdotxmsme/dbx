@@ -6,7 +6,9 @@ use axum::Json;
 use dbx_core::models::connection::ConnectionConfig;
 use serde::Deserialize;
 
+use crate::auth::middleware::AuthenticatedUser;
 use crate::error::AppError;
+use crate::models::PermissionKey;
 use crate::state::WebState;
 
 #[derive(Deserialize)]
@@ -134,8 +136,12 @@ pub async fn close_database_connection(
 
 pub async fn save_connections(
     State(state): State<Arc<WebState>>,
+    user: AuthenticatedUser,
     Json(body): Json<SaveConnectionsRequest>,
 ) -> Result<Json<()>, AppError> {
+    if !user.permissions.contains(&PermissionKey::ConnectionWrite) && !user.permissions.contains(&PermissionKey::Admin) {
+        return Err(AppError(anyhow::anyhow!("Forbidden: requires connection:write permission")));
+    }
     state.app.storage.save_connections(&body.configs).await.map_err(AppError)?;
     let sync = sync_connection_configs(&state, &body.configs).await;
     remove_connection_pools_for_connection_ids(&state, &sync.connection_pool_ids_to_drop).await;
@@ -144,13 +150,32 @@ pub async fn save_connections(
     Ok(Json(()))
 }
 
-pub async fn load_connections(State(state): State<Arc<WebState>>) -> Result<Json<Vec<ConnectionConfig>>, AppError> {
+pub async fn load_connections(
+    State(state): State<Arc<WebState>>,
+    user: AuthenticatedUser,
+) -> Result<Json<Vec<ConnectionConfig>>, AppError> {
     let configs = state.app.storage.load_connections().await.map_err(AppError)?;
     let sync = sync_connection_configs(&state, &configs).await;
     remove_connection_pools_for_connection_ids(&state, &sync.connection_pool_ids_to_drop).await;
     drop_nacos_adapters_for_connection_ids(&state, &sync.nacos_adapter_ids_to_drop).await;
     drop_mq_adapters_for_connection_ids(&state, &sync.mq_adapter_ids_to_drop).await;
-    Ok(Json(configs))
+
+    // Filter by role-granted connections
+    if user.permissions.contains(&PermissionKey::Admin) {
+        Ok(Json(configs))
+    } else {
+        let visible_ids: std::collections::HashSet<String> = state
+            .user_repo
+            .list_visible_connection_ids(user.id, false)
+            .await?
+            .into_iter()
+            .collect();
+        let filtered: Vec<ConnectionConfig> = configs
+            .into_iter()
+            .filter(|c| visible_ids.contains(&c.id))
+            .collect();
+        Ok(Json(filtered))
+    }
 }
 
 struct ConnectionConfigSync {
