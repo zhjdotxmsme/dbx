@@ -3,7 +3,10 @@
 # Stage 1: Build frontend (native, no emulation)
 FROM --platform=$BUILDPLATFORM node:22-slim AS frontend
 WORKDIR /app
-RUN npm i -g pnpm
+# Use Chinese npm mirror to speed up installs
+RUN npm config set registry https://registry.npmmirror.com \
+    && npm i -g pnpm \
+    && pnpm config set registry https://registry.npmmirror.com
 COPY package.json pnpm-lock.yaml ./
 RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
     pnpm install --frozen-lockfile
@@ -15,10 +18,33 @@ RUN pnpm build
 FROM --platform=$BUILDPLATFORM rust:1-bookworm AS backend
 ARG TARGETARCH
 WORKDIR /app
+
+# Use Chinese mirrors for apt, rustup and cargo to speed up builds
+RUN sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list.d/debian.sources \
+    && sed -i 's/security.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list.d/debian.sources
+ENV RUSTUP_UPDATE_ROOT=https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup
+ENV RUSTUP_DIST_SERVER=https://mirrors.tuna.tsinghua.edu.cn/rustup
+ENV CARGO_HOME=/usr/local/cargo
+RUN mkdir -p "$CARGO_HOME"
+RUN cat > "$CARGO_HOME/config.toml" <<'EOF'
+[net]
+git-fetch-with-cli = true
+
+[registries.crates-io]
+protocol = "sparse"
+
+[source.crates-io]
+replace-with = 'ustc'
+
+[source.ustc]
+registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"
+EOF
+
 RUN dpkg --add-architecture arm64 \
     && apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake pkg-config perl python3-pip gcc-aarch64-linux-gnu \
     libfontconfig-dev:arm64 libfreetype-dev:arm64 \
+    && pip3 config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple \
     && pip3 install --break-system-packages ziglang \
     && cargo install cargo-zigbuild \
     && rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
@@ -72,7 +98,9 @@ RUN case "$TARGETARCH" in \
 # Stage 3: Final image
 FROM debian:bookworm-slim
 ARG TARGETPLATFORM
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list.d/debian.sources \
+    && sed -i 's/security.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     fontconfig \
     fonts-dejavu-core \
