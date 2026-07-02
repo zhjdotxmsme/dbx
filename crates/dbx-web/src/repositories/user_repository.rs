@@ -1,6 +1,7 @@
 use anyhow::Result;
-use sqlx::{PgPool, Postgres, QueryBuilder};
+use sqlx::PgPool;
 use uuid::Uuid;
+use std::collections::HashSet;
 
 use crate::models::{Role, RoleKey, User};
 
@@ -283,5 +284,110 @@ impl UserRepository {
         tx.commit().await?;
 
         Ok(created_user)
+    }
+
+    // ── Role-Connection ACL methods ─────────────────────────────────────
+
+    pub async fn get_user_role_ids(&self, user_id: Uuid) -> Result<Vec<Uuid>> {
+        let ids = sqlx::query_scalar!(
+            r#"SELECT role_id FROM user_roles WHERE user_id = $1"#,
+            user_id
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(ids)
+    }
+
+    pub async fn get_connection_ids_for_roles(&self, role_ids: &[Uuid]) -> Result<Vec<String>> {
+        if role_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = sqlx::query_scalar!(
+            r#"SELECT connection_id FROM role_connections WHERE role_id = ANY($1)"#,
+            role_ids
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(ids)
+    }
+
+    pub async fn grant_connection_to_role(
+        &self,
+        role_id: Uuid,
+        connection_id: &str,
+        granted_by: Option<Uuid>,
+    ) -> Result<()> {
+        sqlx::query!(
+            r#"INSERT INTO role_connections (role_id, connection_id, granted_by)
+               VALUES ($1, $2, $3)
+               ON CONFLICT (role_id, connection_id) DO NOTHING"#,
+            role_id,
+            connection_id,
+            granted_by,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn revoke_connection_from_role(
+        &self,
+        role_id: Uuid,
+        connection_id: &str,
+    ) -> Result<()> {
+        sqlx::query!(
+            r#"DELETE FROM role_connections WHERE role_id = $1 AND connection_id = $2"#,
+            role_id,
+            connection_id,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_role_connections(&self, role_id: Uuid) -> Result<Vec<String>> {
+        let ids = sqlx::query_scalar!(
+            r#"SELECT connection_id FROM role_connections WHERE role_id = $1"#,
+            role_id
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(ids)
+    }
+
+    pub async fn create_role_if_missing(&self, name: &str, description: &str) -> Result<Uuid> {
+        let id = sqlx::query_scalar!(
+            r#"INSERT INTO roles (name, description)
+               VALUES ($1, $2)
+               ON CONFLICT (name) DO UPDATE SET description = COALESCE(roles.description, $2)
+               RETURNING id"#,
+            name,
+            description,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    pub async fn user_can_access_connection(
+        &self,
+        user_id: Uuid,
+        connection_id: &str,
+        is_admin: bool,
+    ) -> Result<bool> {
+        if is_admin {
+            return Ok(true);
+        }
+        let role_ids = self.get_user_role_ids(user_id).await?;
+        let visible = self.get_connection_ids_for_roles(&role_ids).await?;
+        Ok(visible.iter().any(|c| c == connection_id))
+    }
+
+    pub async fn list_visible_connection_ids(&self, user_id: Uuid, is_admin: bool) -> Result<Vec<String>> {
+        if is_admin {
+            return Ok(Vec::new());  // admin: caller loads all directly
+        }
+        let role_ids = self.get_user_role_ids(user_id).await?;
+        self.get_connection_ids_for_roles(&role_ids).await
     }
 }
