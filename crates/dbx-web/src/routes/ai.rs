@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::Json;
 use futures::stream::Stream;
@@ -12,6 +12,8 @@ use dbx_core::ai::{
     AiCompletionRequest, AiConfig, AiConversation, AiModelInfo, AiProvider, AiStreamChunk, AiTestConnectionResult,
 };
 use dbx_core::models::connection::DatabaseType;
+
+use crate::auth::middleware::{resolve_user_filter, AuthenticatedUser};
 
 use crate::error::AppError;
 use crate::state::WebState;
@@ -112,22 +114,32 @@ pub async fn load_ai_config(State(state): State<Arc<WebState>>) -> Result<Json<O
 
 pub async fn save_ai_conversation(
     State(state): State<Arc<WebState>>,
+    user: AuthenticatedUser,
     Json(body): Json<SaveAiConversationRequest>,
 ) -> Result<Json<()>, AppError> {
-    state.app.storage.save_ai_conversation(&body.conversation).await.map_err(AppError)?;
+    state.app.storage.save_ai_conversation(&body.conversation, &user.id.to_string()).await.map_err(AppError)?;
     Ok(Json(()))
 }
 
-pub async fn load_ai_conversations(State(state): State<Arc<WebState>>) -> Result<Json<Vec<AiConversation>>, AppError> {
-    let conversations = state.app.storage.load_ai_conversations().await.map_err(AppError)?;
+pub async fn load_ai_conversations(
+    State(state): State<Arc<WebState>>,
+    user: AuthenticatedUser,
+    Query(q): Query<AiAsyncQuery>,
+) -> Result<Json<Vec<AiConversation>>, AppError> {
+    let (filter, audit_target) = resolve_user_filter(&user, q.as_user.as_deref(), q.all.unwrap_or(false))?;
+    if let Some(target) = audit_target {
+        crate::audit::log_audit(&state.pg_pool, user.id, "view_ai_conversations", Some(target), None, None, None).await;
+    }
+    let conversations = state.app.storage.load_ai_conversations(filter.as_deref()).await.map_err(AppError)?;
     Ok(Json(conversations))
 }
 
 pub async fn delete_ai_conversation(
     State(state): State<Arc<WebState>>,
+    user: AuthenticatedUser,
     Path(id): Path<String>,
 ) -> Result<Json<()>, AppError> {
-    state.app.storage.delete_ai_conversation(&id).await.map_err(AppError)?;
+    state.app.storage.delete_ai_conversation(&id, &user.id.to_string()).await.map_err(AppError)?;
     Ok(Json(()))
 }
 

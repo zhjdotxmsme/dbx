@@ -8,8 +8,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use std::collections::HashSet;
+use uuid::Uuid;
 
 use crate::auth::{AuthCheckResponse, AuthService};
+use crate::error::AppError;
 use crate::models::PermissionKey;
 use crate::state::WebState;
 
@@ -105,4 +107,43 @@ where
             Err(StatusCode::FORBIDDEN)
         }
     }
+}
+
+/// Resolves user_id filter and audit target for per-user data routes.
+///
+/// Returns `(filter, audit_target)` where:
+/// - `filter`: `Some(uid)` → `WHERE user_id = ?`, `None` → admin "see all"
+/// - `audit_target`: `Some(Uuid)` → write audit_log, `None` → regular access
+pub fn resolve_user_filter(
+    user: &AuthenticatedUser,
+    as_user: Option<&str>,
+    all: bool,
+) -> Result<(Option<String>, Option<Uuid>), AppError> {
+    let is_admin = user.permissions.contains(&PermissionKey::Admin);
+
+    let as_user_id = match as_user {
+        Some(raw) => {
+            if !is_admin {
+                return Err(AppError(anyhow::anyhow!("Only admin can use as_user")));
+            }
+            let uid = raw.parse::<Uuid>().map_err(|_| {
+                AppError(anyhow::anyhow!("Invalid as_user UUID: {}", raw))
+            })?;
+            Some(uid)
+        }
+        None => None,
+    };
+
+    // Admin flow
+    if let Some(target) = as_user_id {
+        return Ok((Some(target.to_string()), Some(target)));
+    }
+    if all && is_admin {
+        return Ok((None, None));
+    }
+    if is_admin {
+        return Ok((Some(user.id.to_string()), None));
+    }
+    // Non-admin: always filter by own id
+    Ok((Some(user.id.to_string()), None))
 }

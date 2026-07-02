@@ -1,4 +1,5 @@
 mod auth;
+mod audit;
 mod error;
 mod routes;
 mod sse;
@@ -17,9 +18,12 @@ use axum::routing::{delete, get, post};
 use axum::Router;
 use dbx_core::connection::AppState;
 use dbx_core::storage::Storage;
+use sqlx::PgPool;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 
+use crate::auth::AuthService;
+use crate::config::AppConfig;
 use state::WebState;
 
 fn web_body_limit_bytes() -> usize {
@@ -195,6 +199,61 @@ async fn main() {
 
     let public_base_path = normalize_public_base_path(std::env::var("DBX_PUBLIC_BASE_PATH").ok());
 
+    // PostgreSQL pool (for auth / audit / role-connections)
+    let pg_pool = if let Ok(db_url) = std::env::var("DBX_DATABASE_URL") {
+        match PgPool::connect(&db_url).await {
+            Ok(pool) => {
+                tracing::info!("Connected to PostgreSQL at DBX_DATABASE_URL");
+                pool
+            }
+            Err(e) => {
+                tracing::warn!("Failed to connect to PostgreSQL (auth/audit/ACL disabled): {}", e);
+                PgPool::connect("postgresql://localhost:5432/dbx").await.unwrap()
+            }
+        }
+    } else {
+        tracing::warn!("DBX_DATABASE_URL not set; auth/audit/ACL disabled");
+        PgPool::connect("postgresql://localhost:5432/dbx").await.unwrap()
+    };
+
+    // Application config
+    let config = Arc::new(AppConfig::load().expect("Failed to load config"));
+
+    // Auth service (conditional on LDAP config)
+    let auth_service = if let Some(ref ldap_cfg) = config.ldap {
+        if ldap_cfg.enabled {
+            match crate::auth::ldap_client::LdapAuthClient::new(ldap_cfg.clone()).await {
+                Ok(ldap_client) => {
+                    tracing::info!("LDAP authentication enabled");
+                    Some(Arc::new(AuthService::new(
+                        pg_pool.clone(),
+                        Some(Arc::new(ldap_client)),
+                        (*config).clone(),
+                    )))
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to initialize LDAP client: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+                    (*config).clone(),
+                )))
+            }
+            Err(e) => {
+                tracing::warn!("Failed to initialize LDAP client: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let web_state = Arc::new(WebState {
         app: app_state,
         data_dir,
@@ -206,6 +265,9 @@ async fn main() {
         sql_file_executions: RwLock::new(HashMap::new()),
         login_rate_limit: tokio::sync::Mutex::new(state::LoginRateLimit { fail_count: 0, locked_until: None }),
         export_files: RwLock::new(HashMap::new()),
+        pg_pool: pg_pool.clone(),
+        auth_service,
+        config: config.clone(),
     });
 
     // CORS
