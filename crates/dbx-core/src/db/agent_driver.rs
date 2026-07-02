@@ -14,6 +14,9 @@ pub const AGENT_PROTOCOL_VERSION: u32 = 1;
 const RPC_TIMEOUT_SECS: u64 = 30;
 const STARTUP_TIMEOUT_SECS: u64 = 15;
 const STDERR_TAIL_LINES: usize = 20;
+const AGENT_EXIT_DIAGNOSTIC_WAIT_MS: u64 = 200;
+const AGENT_JAVA_TOO_OLD_MESSAGE: &str =
+    "Agent requires Java 21, but DBX started it with an older Java runtime. Use DBX managed JRE 21 or select a Java 21 executable in Driver Manager.";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -120,6 +123,7 @@ pub enum AgentMethod {
     ListSchemas,
     ListTables,
     ListObjects,
+    ListDataTypes,
     CompletionAssistantSearchV1,
     GetObjectSource,
     GetColumns,
@@ -131,14 +135,18 @@ pub enum AgentMethod {
     ExecuteQueryPage,
     FetchQueryPage,
     CloseQuerySession,
+    StartTableRead,
+    FetchTableReadPage,
+    CloseTableReadSession,
     GetExplainInfo,
+    ExecuteBatch,
     ExecuteTransaction,
     Disconnect,
     Shutdown,
 }
 
 impl AgentMethod {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 28] = [
         Self::Handshake,
         Self::Connect,
         Self::TestConnection,
@@ -147,6 +155,7 @@ impl AgentMethod {
         Self::ListSchemas,
         Self::ListTables,
         Self::ListObjects,
+        Self::ListDataTypes,
         Self::CompletionAssistantSearchV1,
         Self::GetObjectSource,
         Self::GetTableDdl,
@@ -158,7 +167,11 @@ impl AgentMethod {
         Self::ExecuteQueryPage,
         Self::FetchQueryPage,
         Self::CloseQuerySession,
+        Self::StartTableRead,
+        Self::FetchTableReadPage,
+        Self::CloseTableReadSession,
         Self::GetExplainInfo,
+        Self::ExecuteBatch,
         Self::ExecuteTransaction,
         Self::Disconnect,
         Self::Shutdown,
@@ -174,6 +187,7 @@ impl AgentMethod {
             Self::ListSchemas => "list_schemas",
             Self::ListTables => "list_tables",
             Self::ListObjects => "list_objects",
+            Self::ListDataTypes => "list_data_types",
             Self::CompletionAssistantSearchV1 => "completion_assistant_search_v1",
             Self::GetObjectSource => "get_object_source",
             Self::GetTableDdl => "get_table_ddl",
@@ -185,7 +199,11 @@ impl AgentMethod {
             Self::ExecuteQueryPage => "execute_query_page",
             Self::FetchQueryPage => "fetch_query_page",
             Self::CloseQuerySession => "close_query_session",
+            Self::StartTableRead => "start_table_read",
+            Self::FetchTableReadPage => "fetch_table_read_page",
+            Self::CloseTableReadSession => "close_table_read_session",
             Self::GetExplainInfo => "get_explain_info",
+            Self::ExecuteBatch => "execute_batch",
             Self::ExecuteTransaction => "execute_transaction",
             Self::Disconnect => "disconnect",
             Self::Shutdown => "shutdown",
@@ -193,21 +211,50 @@ impl AgentMethod {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentTableReadStartParams {
+    pub sql: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    pub page_size: usize,
+    pub max_rows: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fetch_size: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentTableReadPageParams {
+    pub session_id: String,
+    pub page_size: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentTableReadCloseParams {
+    pub session_id: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MongoAgentMethod {
     ListDatabases,
     ListCollections,
     FindDocuments,
+    ServerVersion,
     InsertDocument,
     UpdateDocument,
     DeleteDocument,
 }
 
 impl MongoAgentMethod {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::ListDatabases,
         Self::ListCollections,
         Self::FindDocuments,
+        Self::ServerVersion,
         Self::InsertDocument,
         Self::UpdateDocument,
         Self::DeleteDocument,
@@ -218,6 +265,7 @@ impl MongoAgentMethod {
             Self::ListDatabases => "list_databases",
             Self::ListCollections => "list_collections",
             Self::FindDocuments => "find_documents",
+            Self::ServerVersion => "server_version",
             Self::InsertDocument => "insert_document",
             Self::UpdateDocument => "update_document",
             Self::DeleteDocument => "delete_document",
@@ -336,24 +384,20 @@ impl AgentDriverClient {
         let ready_stdout = match startup_result {
             Ok(Ok(Ok(stdout))) => stdout,
             Ok(Ok(Err(e))) => {
-                return Err(format_agent_process_error(
-                    &e,
-                    child_exit_status(&mut child),
-                    &stderr_tail_snapshot(&stderr_tail),
-                ));
+                return Err(format_agent_startup_error(&e, &mut child, &stderr_tail));
             }
             Ok(Err(e)) => {
-                return Err(format_agent_process_error(
+                return Err(format_agent_startup_error(
                     &format!("Agent startup task failed: {e}"),
-                    child_exit_status(&mut child),
-                    &stderr_tail_snapshot(&stderr_tail),
+                    &mut child,
+                    &stderr_tail,
                 ));
             }
             Err(_) => {
-                return Err(format_agent_process_error(
+                return Err(format_agent_startup_error(
                     &format!("Agent startup timed out ({STARTUP_TIMEOUT_SECS}s)"),
-                    child_exit_status(&mut child),
-                    &stderr_tail_snapshot(&stderr_tail),
+                    &mut child,
+                    &stderr_tail,
                 ));
             }
         };
@@ -544,12 +588,20 @@ impl AgentDriverClient {
         database: &str,
         timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
-        self.call_method_with_timeout(
-            AgentMethod::ListSchemas,
-            serde_json::json!({ "database": database }),
-            timeout_duration,
-        )
-        .await
+        self.list_schemas_filtered(database, None, timeout_duration).await
+    }
+
+    pub async fn list_schemas_filtered<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: &str,
+        visible_schemas: Option<&[String]>,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        let mut params = serde_json::json!({ "database": database });
+        if let Some(visible_schemas) = visible_schemas {
+            params["visible_schemas"] = serde_json::json!(visible_schemas);
+        }
+        self.call_method_with_timeout(AgentMethod::ListSchemas, params, timeout_duration).await
     }
 
     pub async fn list_tables<T: DeserializeOwned + Send + 'static>(
@@ -558,8 +610,21 @@ impl AgentDriverClient {
         schema: &str,
         timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
-        self.call_method_with_timeout(AgentMethod::ListTables, agent_schema_params(database, schema), timeout_duration)
-            .await
+        self.list_tables_filtered(database, schema, None, timeout_duration).await
+    }
+
+    pub async fn list_tables_filtered<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: &str,
+        schema: &str,
+        object_types: Option<&[String]>,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        let mut params = agent_schema_params(database, schema);
+        if let Some(object_types) = object_types {
+            params["object_types"] = serde_json::json!(object_types);
+        }
+        self.call_method_with_timeout(AgentMethod::ListTables, params, timeout_duration).await
     }
 
     pub async fn list_objects<T: DeserializeOwned + Send + 'static>(
@@ -570,6 +635,19 @@ impl AgentDriverClient {
     ) -> Result<T, String> {
         self.call_method_with_timeout(AgentMethod::ListObjects, agent_schema_params(database, schema), timeout_duration)
             .await
+    }
+
+    pub async fn list_data_types<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: &str,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        self.call_method_with_timeout(
+            AgentMethod::ListDataTypes,
+            serde_json::json!({ "database": database }),
+            timeout_duration,
+        )
+        .await
     }
 
     pub async fn completion_assistant_search<T: DeserializeOwned + Send + 'static>(
@@ -756,6 +834,38 @@ impl AgentDriverClient {
         self.call_method(AgentMethod::CloseQuerySession, agent_close_query_session_params(session_id)).await
     }
 
+    pub async fn start_table_read<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        params: AgentTableReadStartParams,
+    ) -> Result<T, String> {
+        self.call_method(AgentMethod::StartTableRead, serde_json::to_value(params).map_err(|e| e.to_string())?).await
+    }
+
+    pub async fn fetch_table_read_page<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        session_id: &str,
+        page_size: usize,
+    ) -> Result<T, String> {
+        self.call_method(
+            AgentMethod::FetchTableReadPage,
+            serde_json::to_value(AgentTableReadPageParams { session_id: session_id.to_string(), page_size })
+                .map_err(|e| e.to_string())?,
+        )
+        .await
+    }
+
+    pub async fn close_table_read_session<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        session_id: &str,
+    ) -> Result<T, String> {
+        self.call_method(
+            AgentMethod::CloseTableReadSession,
+            serde_json::to_value(AgentTableReadCloseParams { session_id: session_id.to_string() })
+                .map_err(|e| e.to_string())?,
+        )
+        .await
+    }
+
     pub async fn execute_transaction<T: DeserializeOwned + Send + 'static>(
         &mut self,
         database: Option<&str>,
@@ -763,6 +873,21 @@ impl AgentDriverClient {
         schema: Option<&str>,
     ) -> Result<T, String> {
         self.call_method(AgentMethod::ExecuteTransaction, agent_transaction_params(database, statements, schema)).await
+    }
+
+    pub async fn execute_batch<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: Option<&str>,
+        statements: &[String],
+        schema: Option<&str>,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        self.call_method_with_timeout(
+            AgentMethod::ExecuteBatch,
+            agent_transaction_params(database, statements, schema),
+            timeout_duration,
+        )
+        .await
     }
 
     pub async fn call_mongo_method<T: DeserializeOwned + Send + 'static>(
@@ -797,6 +922,13 @@ impl AgentDriverClient {
         params: Value,
     ) -> Result<T, String> {
         self.call_mongo_method(MongoAgentMethod::FindDocuments, params).await
+    }
+
+    pub async fn mongo_server_version<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: &str,
+    ) -> Result<T, String> {
+        self.call_mongo_method(MongoAgentMethod::ServerVersion, mongo_database_params(database)).await
     }
 
     pub async fn mongo_insert_document<T: DeserializeOwned + Send + 'static>(
@@ -982,9 +1114,7 @@ fn agent_java_args(jar_path: &str) -> Vec<String> {
         args.push("-Djava.net.preferIPv4Stack=true".to_string());
     }
 
-    if !agent_jar_path_matches_key(jar_path, "oracle-10g") {
-        args.push("--add-opens=java.sql/java.sql=ALL-UNNAMED".to_string());
-    }
+    args.push("--add-opens=java.sql/java.sql=ALL-UNNAMED".to_string());
 
     args.extend(["-XX:TieredStopAtLevel=1", "-XX:+UseSerialGC", "-jar", jar_path].into_iter().map(str::to_string));
 
@@ -1068,6 +1198,15 @@ fn child_exit_status(child: &mut Child) -> Option<String> {
     }
 }
 
+fn child_exit_status_after_short_wait(child: &mut Child) -> Option<String> {
+    let status = child_exit_status(child);
+    if status.is_some() {
+        return status;
+    }
+    std::thread::sleep(Duration::from_millis(AGENT_EXIT_DIAGNOSTIC_WAIT_MS));
+    child_exit_status(child)
+}
+
 fn stderr_tail_snapshot(stderr_tail: &Arc<Mutex<StderrTail>>) -> StderrTail {
     let snapshot = stderr_tail.lock().map(|tail| tail.snapshot()).unwrap_or_default();
     let mut tail = StderrTail::with_capacity(STDERR_TAIL_LINES);
@@ -1078,20 +1217,44 @@ fn stderr_tail_snapshot(stderr_tail: &Arc<Mutex<StderrTail>>) -> StderrTail {
 }
 
 fn format_agent_process_error(base: &str, exit_status: Option<String>, stderr_tail: &StderrTail) -> String {
-    let mut parts = vec![base.to_string()];
+    let stderr = stderr_tail.snapshot();
+    let mut parts = Vec::new();
+    if let Some(hint) = agent_process_error_hint(&stderr) {
+        parts.push(hint.to_string());
+        parts.push(format!("details: {base}"));
+    } else {
+        parts.push(base.to_string());
+    }
     if let Some(status) = exit_status {
         parts.push(format!("agent process exited with {status}"));
     }
-    let stderr = stderr_tail.snapshot();
     if !stderr.is_empty() {
         parts.push(format!("recent stderr:\n{stderr}"));
     }
     parts.join(". ")
 }
 
+fn agent_process_error_hint(stderr: &str) -> Option<&'static str> {
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("unsupportedclassversionerror")
+        && (lower.contains("class file version 65.0") || lower.contains("only recognizes class file versions up to"))
+    {
+        return Some(AGENT_JAVA_TOO_OLD_MESSAGE);
+    }
+    None
+}
+
+fn format_agent_startup_error(base: &str, child: &mut Child, stderr_tail: &Arc<Mutex<StderrTail>>) -> String {
+    format_agent_process_error(base, child_exit_status_after_short_wait(child), &stderr_tail_snapshot(stderr_tail))
+}
+
 impl AgentDriverClient {
     fn format_agent_process_error(&mut self, base: &str) -> String {
-        format_agent_process_error(base, child_exit_status(&mut self.child), &stderr_tail_snapshot(&self.stderr_tail))
+        format_agent_process_error(
+            base,
+            child_exit_status_after_short_wait(&mut self.child),
+            &stderr_tail_snapshot(&self.stderr_tail),
+        )
     }
 }
 
@@ -1106,11 +1269,15 @@ mod tests {
     use super::{
         agent_close_query_session_params, agent_handshake_params, agent_java_args, agent_object_source_params,
         agent_proxy_env_vars, agent_schema_params, agent_schema_table_params, agent_supports_capability,
-        agent_transaction_params, format_agent_process_error, is_unsupported_handshake_error, mongo_collection_params,
-        mongo_database_params, mongo_document_id_params, read_agent_line, AgentCapability, AgentDriverClient,
-        AgentHandshake, AgentKvMethod, AgentMethod, MongoAgentMethod, StderrTail, AGENT_PROTOCOL_VERSION,
+        agent_transaction_params, format_agent_process_error, format_agent_startup_error,
+        is_unsupported_handshake_error, mongo_collection_params, mongo_database_params, mongo_document_id_params,
+        read_agent_line, start_stderr_collector, AgentCapability, AgentDriverClient, AgentHandshake, AgentKvMethod,
+        AgentMethod, AgentTableReadCloseParams, AgentTableReadPageParams, AgentTableReadStartParams, MongoAgentMethod,
+        StderrTail, AGENT_PROTOCOL_VERSION,
     };
     use std::io::Cursor;
+    use std::process::{Command, Stdio};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn agent_java_args_include_oracle_network_compatibility_flags() {
@@ -1125,13 +1292,6 @@ mod tests {
         let args = agent_java_args("/tmp/dbx-agent-dameng.jar");
 
         assert!(args.iter().any(|arg| arg == "--add-opens=java.sql/java.sql=ALL-UNNAMED"));
-    }
-
-    #[test]
-    fn agent_java_args_skip_module_flags_for_oracle_10g_profile() {
-        let args = agent_java_args("/tmp/dbx/drivers/oracle-10g/agent.jar");
-
-        assert!(!args.iter().any(|arg| arg == "--add-opens=java.sql/java.sql=ALL-UNNAMED"));
     }
 
     #[test]
@@ -1206,6 +1366,30 @@ mod tests {
     }
 
     #[test]
+    fn startup_error_waits_briefly_for_exit_status_and_stderr_tail() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 0.05; echo 'java.lang.UnsupportedClassVersionError: class file version 65.0' >&2; exit 1")
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("child should start");
+        let stderr_tail = Arc::new(Mutex::new(StderrTail::default()));
+        start_stderr_collector(child.stderr.take().expect("stderr should be piped"), Arc::clone(&stderr_tail));
+
+        let message = format_agent_startup_error(
+            "Failed to read startup line from agent: end of stream",
+            &mut child,
+            &stderr_tail,
+        );
+
+        assert!(message.contains("Failed to read startup line from agent: end of stream"));
+        assert!(message.contains("agent process exited with exit status: 1"));
+        assert!(message.contains("Agent requires Java 21"));
+        assert!(message.contains("details: Failed to read startup line from agent: end of stream"));
+        assert!(message.contains("UnsupportedClassVersionError"));
+    }
+
+    #[test]
     fn stderr_tail_keeps_recent_lines_only() {
         let mut stderr_tail = StderrTail::with_capacity(3);
         stderr_tail.push_line("line 1".to_string());
@@ -1261,6 +1445,7 @@ mod tests {
         assert_eq!(AgentMethod::ListSchemas.as_str(), "list_schemas");
         assert_eq!(AgentMethod::ListTables.as_str(), "list_tables");
         assert_eq!(AgentMethod::ListObjects.as_str(), "list_objects");
+        assert_eq!(AgentMethod::ListDataTypes.as_str(), "list_data_types");
         assert_eq!(AgentMethod::CompletionAssistantSearchV1.as_str(), "completion_assistant_search_v1");
         assert_eq!(AgentMethod::GetObjectSource.as_str(), "get_object_source");
         assert_eq!(AgentMethod::GetColumns.as_str(), "get_columns");
@@ -1272,6 +1457,10 @@ mod tests {
         assert_eq!(AgentMethod::ExecuteQueryPage.as_str(), "execute_query_page");
         assert_eq!(AgentMethod::FetchQueryPage.as_str(), "fetch_query_page");
         assert_eq!(AgentMethod::CloseQuerySession.as_str(), "close_query_session");
+        assert_eq!(AgentMethod::StartTableRead.as_str(), "start_table_read");
+        assert_eq!(AgentMethod::FetchTableReadPage.as_str(), "fetch_table_read_page");
+        assert_eq!(AgentMethod::CloseTableReadSession.as_str(), "close_table_read_session");
+        assert_eq!(AgentMethod::ExecuteBatch.as_str(), "execute_batch");
         assert_eq!(AgentMethod::ExecuteTransaction.as_str(), "execute_transaction");
         assert_eq!(AgentMethod::Disconnect.as_str(), "disconnect");
         assert_eq!(AgentMethod::Shutdown.as_str(), "shutdown");
@@ -1282,6 +1471,7 @@ mod tests {
         assert_eq!(MongoAgentMethod::ListDatabases.as_str(), "list_databases");
         assert_eq!(MongoAgentMethod::ListCollections.as_str(), "list_collections");
         assert_eq!(MongoAgentMethod::FindDocuments.as_str(), "find_documents");
+        assert_eq!(MongoAgentMethod::ServerVersion.as_str(), "server_version");
         assert_eq!(MongoAgentMethod::InsertDocument.as_str(), "insert_document");
         assert_eq!(MongoAgentMethod::UpdateDocument.as_str(), "update_document");
         assert_eq!(MongoAgentMethod::DeleteDocument.as_str(), "delete_document");
@@ -1312,6 +1502,7 @@ mod tests {
         let _execute_query_page = AgentDriverClient::execute_query_page::<serde_json::Value>;
         let _fetch_query_page = AgentDriverClient::fetch_query_page::<serde_json::Value>;
         let _close_query_session = AgentDriverClient::close_query_session::<serde_json::Value>;
+        let _execute_batch = AgentDriverClient::execute_batch::<serde_json::Value>;
         let _execute_transaction = AgentDriverClient::execute_transaction::<serde_json::Value>;
     }
 
@@ -1320,6 +1511,7 @@ mod tests {
         let _mongo_list_databases = AgentDriverClient::mongo_list_databases::<serde_json::Value>;
         let _mongo_list_collections = AgentDriverClient::mongo_list_collections::<serde_json::Value>;
         let _mongo_find_documents = AgentDriverClient::mongo_find_documents::<serde_json::Value>;
+        let _mongo_server_version = AgentDriverClient::mongo_server_version::<serde_json::Value>;
         let _mongo_insert_document = AgentDriverClient::mongo_insert_document::<serde_json::Value>;
         let _mongo_update_document = AgentDriverClient::mongo_update_document::<serde_json::Value>;
         let _mongo_delete_document = AgentDriverClient::mongo_delete_document::<serde_json::Value>;
@@ -1328,6 +1520,44 @@ mod tests {
     #[test]
     fn exposes_kv_protocol_wrapper() {
         let _call_kv_method = AgentDriverClient::call_kv_method::<serde_json::Value>;
+    }
+
+    #[test]
+    fn exposes_table_read_protocol_wrappers() {
+        let _start_table_read = AgentDriverClient::start_table_read::<serde_json::Value>;
+        let _fetch_table_read_page = AgentDriverClient::fetch_table_read_page::<serde_json::Value>;
+        let _close_table_read_session = AgentDriverClient::close_table_read_session::<serde_json::Value>;
+    }
+
+    #[test]
+    fn serializes_table_read_params_with_agent_field_names() {
+        let start = serde_json::to_value(AgentTableReadStartParams {
+            sql: "SELECT * FROM users".to_string(),
+            database: Some("ORCL".to_string()),
+            schema: Some("APP".to_string()),
+            page_size: 500,
+            max_rows: 1000,
+            fetch_size: Some(500),
+        })
+        .unwrap();
+        assert_eq!(
+            start,
+            serde_json::json!({
+                "sql": "SELECT * FROM users",
+                "database": "ORCL",
+                "schema": "APP",
+                "pageSize": 500,
+                "maxRows": 1000,
+                "fetchSize": 500,
+            })
+        );
+
+        let page = serde_json::to_value(AgentTableReadPageParams { session_id: "table-1".to_string(), page_size: 250 })
+            .unwrap();
+        assert_eq!(page, serde_json::json!({ "sessionId": "table-1", "pageSize": 250 }));
+
+        let close = serde_json::to_value(AgentTableReadCloseParams { session_id: "table-1".to_string() }).unwrap();
+        assert_eq!(close, serde_json::json!({ "sessionId": "table-1" }));
     }
 
     #[test]

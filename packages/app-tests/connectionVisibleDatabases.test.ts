@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
 import { buildDraftVisibleDatabasesConnectionId, connectionCanChooseVisibleDatabases, visibleDatabaseSelectionIsStale, initialVisibleDatabaseSelection } from "../../apps/desktop/src/lib/connectionVisibleDatabases.ts";
+import { connectionUsesVisibleSchemaFilter, filterDatabaseNamesForConnection } from "../../apps/desktop/src/lib/visibleDatabases.ts";
 import type { ConnectionConfig } from "../../apps/desktop/src/types/database.ts";
 
 function config(overrides: Partial<ConnectionConfig> = {}): ConnectionConfig {
@@ -50,6 +51,18 @@ test("initial selection uses default visible database names when no filter is co
 
 test("ZooKeeper connections do not offer visible database selection", () => {
   assert.equal(connectionCanChooseVisibleDatabases(config({ db_type: "zookeeper" })), false);
+});
+
+test("OceanBase Oracle uses schema filtering for visible object selection", () => {
+  assert.equal(connectionUsesVisibleSchemaFilter(config({ db_type: "oceanbase-oracle" })), true);
+  assert.equal(connectionUsesVisibleSchemaFilter(config({ db_type: "mysql", driver_profile: "oceanbase" })), false);
+});
+
+test("Dameng default SYSDBA user remains selectable", () => {
+  assert.deepEqual(
+    filterDatabaseNamesForConnection(["SYS", "SYSDBA", "SYSAUDITOR"], config({ db_type: "dameng" })),
+    ["SYSDBA"],
+  );
 });
 
 test("visible database selection is stale when connection target changes", () => {

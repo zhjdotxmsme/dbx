@@ -286,6 +286,7 @@ mod tests {
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
             redis_key_separator: dbx_core::models::connection::default_redis_key_separator(),
+            redis_scan_page_size: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -318,6 +319,7 @@ mod tests {
         let state = Arc::new(WebState {
             app,
             data_dir: dir.clone(),
+            public_base_path: "/".to_string(),
             password_disabled: false,
             password_hash: RwLock::new(None),
             sessions: RwLock::new(HashSet::new()),

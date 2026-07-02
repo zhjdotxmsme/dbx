@@ -68,8 +68,35 @@ public abstract class BaseDatabaseAgent implements DatabaseAgent {
     }
 
     @Override
+    public QueryPageResult startTableRead(String sql, String schema, QueryPageOptions options) {
+        return JdbcExecutor.INSTANCE.startTableRead(
+            requireConnected(),
+            sql,
+            schema,
+            this::setSchemaSQL,
+            options,
+            JdbcExecutor.INSTANCE::defaultResultValue
+        );
+    }
+
+    @Override
+    public QueryPageResult fetchTableReadPage(String sessionId, int pageSize) {
+        return JdbcExecutor.INSTANCE.fetchTableReadPage(sessionId, pageSize);
+    }
+
+    @Override
+    public boolean closeTableReadSession(String sessionId) {
+        return JdbcExecutor.INSTANCE.closeTableReadSession(sessionId);
+    }
+
+    @Override
     public QueryResult executeTransaction(List<String> statements, String schema) {
         return TransactionExecutor.executeUpdateStatements(requireConnected(), statements, schema, this::setSchemaSQL);
+    }
+
+    @Override
+    public QueryResult executeBatch(List<String> statements, String schema) {
+        return BatchExecutor.executeBatchStatements(requireConnected(), statements, schema, this::setSchemaSQL);
     }
 
     protected Connection requireConnected() {

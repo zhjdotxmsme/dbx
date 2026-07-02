@@ -6,8 +6,31 @@ import { currentLocale, type Locale } from "@/i18n";
 import { aiTableMentionKey, type AiTableMention } from "@/lib/aiTableMentions";
 import { aiSkillForAction } from "@/lib/aiSkills";
 import { isSchemaAware } from "@/lib/databaseCapabilities";
+import { effectiveDatabaseTypeForConnection } from "@/lib/jdbcDialect";
 
 import type { AgentEvent } from "@/lib/tauri";
+
+const VECTOR_DB_TYPES: ReadonlySet<DatabaseType> = new Set([
+  "qdrant",
+  "milvus",
+  "weaviate",
+  "chromadb",
+  // If modifying this, also update is_vector_db() in crates/dbx-core/src/agent_tools.rs.
+]);
+
+export function isVectorDbType(dbType: DatabaseType): boolean {
+  return VECTOR_DB_TYPES.has(dbType);
+}
+
+function dbLabel(dbType: DatabaseType): string {
+  const labels: Partial<Record<DatabaseType, string>> = {
+    qdrant: "Qdrant",
+    milvus: "Milvus",
+    weaviate: "Weaviate",
+    chromadb: "ChromaDB",
+  };
+  return labels[dbType] || dbType;
+}
 
 export type AiAction = "generate" | "explain" | "optimize" | "fix" | "convert" | "sampleData";
 export type AiAssistantMode = "ask" | "agent";
@@ -47,33 +70,37 @@ export interface AiRequestInput {
   context: AiContext;
 }
 
-function buildAgentRequest(input: AiRequestInput, history?: api.AiMessage[]): { messages: api.AiMessage[]; systemPrompt: string; maxTokens: number; temperature: number } {
+function buildAgentRequest(input: AiRequestInput, history?: api.AiMessage[]): { messages: api.AiMessage[]; systemPrompt: string; taskContract: api.AiTaskContract; maxTokens: number; temperature: number } {
   const isZh = isChineseLocale(currentLocale());
-  const skill = aiSkillForAction(input.action);
   const systemPrompt = buildSystemPrompt(input.action, input.context, input.mode);
-  const instruction = isZh ? skill.userInstruction.zh : skill.userInstruction.en;
-  const userPrompt = [`Action: ${input.action}`, instruction, "", "User request:", input.instruction.trim() || "(No extra instruction provided.)"].join("\n");
+  const userPrompt = buildUserPrompt(input.action, input.context, input.instruction, isZh);
+  const taskContract: api.AiTaskContract = {
+    action: input.action,
+    mode: input.mode || "ask",
+    userRequest: input.instruction.trim(),
+  };
 
   const messages: api.AiMessage[] = [...(history || []), { role: "user", content: userPrompt }];
 
   const params = actionParams(input.action);
   const maxTokens = input.config.enableThinking ? Math.max(params.maxTokens, 8192) : params.maxTokens;
-  return { messages, systemPrompt, maxTokens, temperature: params.temperature };
+  return { messages, systemPrompt, taskContract, maxTokens, temperature: params.temperature };
 }
 
 export async function runAiAction(input: AiRequestInput, history?: api.AiMessage[]): Promise<string> {
-  const { messages, systemPrompt, maxTokens, temperature } = buildAgentRequest(input, history);
+  const { messages, systemPrompt, taskContract, maxTokens, temperature } = buildAgentRequest(input, history);
   return api.aiComplete({
     config: input.config,
     systemPrompt,
     messages,
+    taskContract,
     maxTokens,
     temperature,
   });
 }
 
 export async function runAiStream(input: AiRequestInput, history: api.AiMessage[] | undefined, onDelta: (delta: string) => void, sessionId?: string, onReasoningDelta?: (delta: string) => void): Promise<void> {
-  const { messages, systemPrompt, maxTokens, temperature } = buildAgentRequest(input, history);
+  const { messages, systemPrompt, taskContract, maxTokens, temperature } = buildAgentRequest(input, history);
   const sid = sessionId || uuid();
 
   await api.aiStream(
@@ -82,6 +109,7 @@ export async function runAiStream(input: AiRequestInput, history: api.AiMessage[
       config: input.config,
       systemPrompt,
       messages,
+      taskContract,
       maxTokens,
       temperature,
     },
@@ -95,7 +123,7 @@ export async function runAiStream(input: AiRequestInput, history: api.AiMessage[
 }
 
 export async function runAgentStream(input: AiRequestInput, history: api.AiMessage[] | undefined, onEvent: (event: AgentEvent) => void, sessionId?: string): Promise<string> {
-  const { messages, systemPrompt, maxTokens, temperature } = buildAgentRequest(input, history);
+  const { messages, systemPrompt, taskContract, maxTokens, temperature } = buildAgentRequest(input, history);
   const sid = sessionId || uuid();
 
   return api.aiAgentStream(
@@ -104,6 +132,7 @@ export async function runAgentStream(input: AiRequestInput, history: api.AiMessa
       config: input.config,
       systemPrompt,
       messages,
+      taskContract,
       maxTokens,
       temperature,
     },
@@ -113,6 +142,17 @@ export async function runAgentStream(input: AiRequestInput, history: api.AiMessa
     onEvent,
     input.mode || "ask",
   );
+}
+
+export function buildUserPrompt(action: AiAction, context: AiContext, instruction: string, isZh: boolean): string {
+  const userRequest = instruction.trim() || (isZh ? "（无额外说明）" : "(No extra instruction provided.)");
+  if (isVectorDbType(context.databaseType)) {
+    // Vector databases: skip SQL action instructions, only send the user's request
+    return userRequest;
+  }
+  const skill = aiSkillForAction(action);
+  const skillInstruction = isZh ? skill.userInstruction.zh : skill.userInstruction.en;
+  return [`Action: ${action}`, skillInstruction, "", "User request:", userRequest].join("\n");
 }
 
 function actionParams(action: AiAction): { maxTokens: number; temperature: number } {
@@ -133,6 +173,9 @@ export function extractSql(text: string): string {
 }
 
 export function buildSystemPrompt(action: AiAction, context: AiContext, mode: AiAssistantMode = "ask"): string {
+  if (isVectorDbType(context.databaseType)) {
+    return buildVectorSystemPrompt(context, mode);
+  }
   const schema = formatSchema(context);
   const resultPreview = context.lastResultPreview ? `\nLast result preview:\n${context.lastResultPreview}\n` : "";
   const lastError = context.lastError ? `\nLast error:\n${context.lastError}\n` : "";
@@ -179,6 +222,9 @@ function buildBasePromptLines(isZh: boolean): string[] {
     isZh ? "精确、保守，根据当前数据库方言生成 SQL。" : "Be precise, conservative, and adapt SQL to the active database dialect.",
     isZh ? "严格使用当前数据库方言；标识符引用、分页、日期函数、字符串拼接、LIMIT/TOP/OFFSET 语法必须匹配数据库类型。" : "Strictly use the active database dialect; identifier quoting, pagination, date functions, string concatenation, and LIMIT/TOP/OFFSET syntax must match the database type.",
     isZh
+      ? '标识符引用必须匹配当前连接类型：MySQL/MariaDB 用反引号 `name`，PostgreSQL/SQLite/Oracle 等用双引号 "name"，SQL Server 用方括号 [name]；不要因为用户口头提到其他数据库而切换方言。'
+      : 'Identifier quoting must match the active connection type: MySQL/MariaDB use backticks `name`, PostgreSQL/SQLite/Oracle and similar dialects use double quotes "name", and SQL Server uses brackets [name]. Do not switch dialects merely because the user mentions another database in prose.',
+    isZh
       ? "对于普通数据查询，优先使用下面已加载的 Schema 上下文，不要为了重复确认已给出的结构而查询 information_schema 或系统表。但当用户询问某表的字段详情、列信息时，应使用 get_columns 工具获取最权威完整的定义。"
       : "For ordinary data queries, prefer the loaded schema context below. Do not query information_schema or system tables merely to rediscover structure already provided. However, when the user asks for detailed column/field information of a specific table, use the get_columns tool for the authoritative and complete definition.",
     isZh
@@ -192,6 +238,50 @@ function buildBasePromptLines(isZh: boolean): string[] {
     isZh ? "对于 DROP、DELETE、TRUNCATE、ALTER 或没有 WHERE 的 UPDATE，简要警告并优先提供安全的 SELECT 预览。" : "For destructive statements (DROP, DELETE, TRUNCATE, ALTER, UPDATE without WHERE), warn briefly and prefer a safer SELECT preview.",
     isZh ? "对于 UPDATE 或 DELETE，必须带 WHERE 并说明影响范围；生产库写操作只给建议，不主动建议执行。" : "For UPDATE or DELETE, require a WHERE clause and explain the affected scope; for production writes, provide guidance but do not proactively suggest execution.",
     isZh ? "当用户回复简短肯定词时（例如：需要、好、可以、对），直接执行你之前提议的动作，不要再反问确认。" : "When the user replies with a short affirmative (e.g.: Yes, OK, Sure, Do it), directly execute the action you previously proposed — do not ask for confirmation again.",
+  ];
+}
+
+function buildVectorSystemPrompt(context: AiContext, mode: AiAssistantMode): string {
+  const isZh = isChineseLocale(currentLocale());
+  const schema = formatSchema(context);
+  const resultPreview = context.lastResultPreview ? `\nLast result preview:\n${context.lastResultPreview}\n` : "";
+  const lastError = context.lastError ? `\nLast error:\n${context.lastError}\n` : "";
+  const lines: string[] = [
+    isZh ? `你是 DBX 内置的向量数据库助手。当前连接的是 ${dbLabel(context.databaseType)} 数据库。用中文回复。` : `You are DBX's vector database assistant. Connected to ${dbLabel(context.databaseType)}. Reply in English.`,
+    isZh ? "数据存储在集合（collections）中，每条记录包含唯一标识及可选的元数据负载（payload/metadata）。" : "Data is stored in collections. Each record has a unique identifier and optional metadata payload.",
+    ...buildVectorModePromptLines(context, mode, isZh),
+    "",
+    `Database type: ${context.databaseType}`,
+    `Connection: ${context.connectionName}`,
+    `Database: ${context.database}`,
+    schemaCoverageLine(context, isZh),
+    "",
+    `Current collection:\n${context.currentSql.trim() || "(none)"}`,
+    lastError,
+    resultPreview,
+    "",
+    `Schema:\n${schema}`,
+  ];
+
+  if (context.schemaScope === "focused_table") {
+    lines.push(
+      isZh
+        ? "Schema 上下文只覆盖当前打开的集合；数据库中可能还有其他集合。用户询问当前有哪些集合或提到上下文中不存在的集合时，不要直接断言不存在，先用 list_collections 工具确认。"
+        : "Schema context covers only the currently opened collection; the database may contain other collections. When the user asks what collections exist or mentions a collection absent from context, do not conclude it is missing; use list_collections to verify first.",
+    );
+  }
+
+  return lines.filter(Boolean).join("\n");
+}
+
+function buildVectorModePromptLines(context: AiContext, mode: AiAssistantMode, isZh: boolean): string[] {
+  if (mode === "agent") {
+    return [isZh ? "你处于 Agent 模式。你有以下工具可用：list_collections、browse_collection。" : "You are in Agent mode. You have the following tools available: list_collections, browse_collection."];
+  }
+  return [
+    isZh
+      ? `你处于 Ask 模式。你只能使用 list_collections 确认集合清单；不要浏览集合数据。${dbLabel(context.databaseType)} 的查询格式为 REST API（METHOD /path + JSON body），具体格式因数据库类型而异。只生成查询请求文本和说明，不要暗示已经执行。`
+      : `You are in Ask mode. You may only use list_collections to inspect collection names; do not browse collection data. ${dbLabel(context.databaseType)} uses a REST API query format (METHOD /path + JSON body) that varies by database type. Generate query strings and explanations only; do not imply execution.`,
   ];
 }
 
@@ -214,7 +304,10 @@ function buildModePromptLines(mode: AiAssistantMode, isZh: boolean): string[] {
 
 function schemaCoverageLine(context: AiContext, isZh: boolean): string {
   if (context.schemaScope === "focused_table") {
-    return isZh ? "Schema context scope: focused table only; not a complete database table list." : "Schema context scope: focused table only; not a complete database table list.";
+    if (isVectorDbType(context.databaseType)) {
+      return isZh ? "Schema 上下文只覆盖当前打开的集合，不是完整的集合列表。" : "Schema context scope: focused collection only; not a complete collection list.";
+    }
+    return "Schema context scope: focused table only; not a complete database table list.";
   }
   return context.truncated ? "Schema context is truncated." : "Schema context is complete for the loaded database scope.";
 }
@@ -262,10 +355,12 @@ function formatSchema(context: AiContext): string {
 export async function buildAiContext(tab: QueryTab, connection: ConnectionConfig, options: { maxTables?: number; maxColumnsPerTable?: number; mentionedTables?: AiTableMention[] } = {}): Promise<AiContext> {
   const maxTables = options.maxTables ?? 50;
   const maxColumnsPerTable = options.maxColumnsPerTable ?? 40;
+  const databaseType = aiDatabaseTypeForConnection(connection);
   const tables: AiSchemaTable[] = [];
   const tableKeys = new Set<string>();
   let truncated = false;
   let schemaScope: AiContext["schemaScope"] = "database";
+  let currentCollectionName: string | undefined;
 
   if (tab.tableMeta) {
     schemaScope = "focused_table";
@@ -295,7 +390,43 @@ export async function buildAiContext(tab: QueryTab, connection: ConnectionConfig
     tables.push(entry);
   }
 
-  if (!tab.tableMeta && !["redis", "mongodb"].includes(connection.db_type)) {
+  // Vector databases: load collections instead of SQL tables
+  if (isVectorDbType(databaseType)) {
+    try {
+      const collections = await api.vectorListCollections(tab.connectionId, tab.database);
+
+      // Find the currently opened collection (tab.sql is UUID for ChromaDB, name for others)
+      const currentCollection = collections.find((c) => c.id === tab.sql || c.name === tab.sql);
+      if (currentCollection) {
+        schemaScope = "focused_table";
+        currentCollectionName = currentCollection.name;
+        tables.push({
+          name: currentCollection.name,
+          tableType: "COLLECTION",
+          comment: currentCollection.dimension ? `${currentCollection.dimension}d vector` : undefined,
+          columns: [],
+        });
+        tableKeys.add(aiTableMentionKey(undefined, currentCollection.name));
+      }
+
+      for (const col of collections.slice(0, maxTables)) {
+        const key = aiTableMentionKey(undefined, col.name);
+        if (tableKeys.has(key)) continue;
+        tables.push({
+          name: col.name,
+          tableType: "COLLECTION",
+          comment: col.dimension ? `${col.dimension}d vector` : undefined,
+          columns: [],
+        });
+        tableKeys.add(key);
+      }
+      if (collections.length > maxTables) truncated = true;
+    } catch {
+      truncated = true;
+    }
+  }
+
+  if (!tab.tableMeta && !["redis", "mongodb"].includes(connection.db_type) && !isVectorDbType(databaseType)) {
     try {
       const schemas = await loadCandidateSchemas(tab, connection);
       for (const schema of schemas) {
@@ -310,7 +441,7 @@ export async function buildAiContext(tab: QueryTab, connection: ConnectionConfig
               api.listIndexes(tab.connectionId, tab.database, schema, table.name).catch(() => [] as IndexInfo[]),
               api.listForeignKeys(tab.connectionId, tab.database, schema, table.name).catch(() => [] as ForeignKeyInfo[]),
             ]).then(([columns, indexes, foreignKeys]) => ({
-              schema: schema === tab.database && !isSchemaAware(connection.db_type) ? undefined : schema,
+              schema: schema === tab.database && !isSchemaAware(databaseType) ? undefined : schema,
               name: table.name,
               tableType: table.table_type,
               comment: table.comment,
@@ -340,9 +471,9 @@ export async function buildAiContext(tab: QueryTab, connection: ConnectionConfig
   return {
     connectionId: tab.connectionId,
     connectionName: connection.name,
-    databaseType: connection.db_type,
+    databaseType,
     database: tab.database,
-    currentSql: tab.sql,
+    currentSql: currentCollectionName ?? tab.sql,
     lastError: extractLastError(tab.result),
     lastResultPreview: formatResultPreview(tab.result),
     tables,
@@ -352,6 +483,7 @@ export async function buildAiContext(tab: QueryTab, connection: ConnectionConfig
 }
 
 async function loadMentionedTableContext(tab: QueryTab, connection: ConnectionConfig, mention: AiTableMention, maxColumnsPerTable: number): Promise<AiSchemaTable | undefined> {
+  const databaseType = aiDatabaseTypeForConnection(connection);
   const schema = await resolveMentionedTableSchema(tab, connection, mention);
   const [columns, indexes, foreignKeys, tableComment] = await Promise.all([
     api.getColumns(tab.connectionId, tab.database, schema, mention.table),
@@ -360,7 +492,7 @@ async function loadMentionedTableContext(tab: QueryTab, connection: ConnectionCo
     loadTableComment(tab.connectionId, tab.database, schema, mention.table).catch(() => undefined),
   ]);
   return {
-    schema: schema === tab.database && !isSchemaAware(connection.db_type) ? undefined : schema,
+    schema: schema === tab.database && !isSchemaAware(databaseType) ? undefined : schema,
     name: mention.table,
     tableType: "TABLE",
     comment: tableComment,
@@ -380,7 +512,7 @@ async function resolveMentionedTableSchema(tab: QueryTab, connection: Connection
   if (tab.tableMeta?.tableName.toLowerCase() === mention.table.toLowerCase() && tab.tableMeta.schema) {
     return tab.tableMeta.schema;
   }
-  if (isSchemaAware(connection.db_type)) {
+  if (isSchemaAware(aiDatabaseTypeForConnection(connection))) {
     const schemas = await loadCandidateSchemas(tab, connection);
     for (const schema of schemas) {
       const tables = await api.listTables(tab.connectionId, tab.database, schema, mention.table, 10).catch(() => []);
@@ -391,11 +523,15 @@ async function resolveMentionedTableSchema(tab: QueryTab, connection: Connection
 }
 
 async function loadCandidateSchemas(tab: QueryTab, connection: ConnectionConfig): Promise<string[]> {
-  if (isSchemaAware(connection.db_type)) {
+  if (isSchemaAware(aiDatabaseTypeForConnection(connection))) {
     const schemas = await api.listSchemas(tab.connectionId, tab.database);
     return prioritizeSchemas(schemas);
   }
   return [tab.database || connection.database || "main"];
+}
+
+function aiDatabaseTypeForConnection(connection: ConnectionConfig): DatabaseType {
+  return effectiveDatabaseTypeForConnection(connection) ?? connection.db_type;
 }
 
 function prioritizeSchemas(schemas: string[]): string[] {

@@ -26,6 +26,7 @@ impl Default for NacosCapabilities {
 #[serde(rename_all = "camelCase")]
 pub struct NacosConnectionInfo {
     pub server_addr: String,
+    pub display_server_addr: String,
     pub namespace: String,
     pub server_version: Option<String>,
     pub auth: String,
@@ -77,6 +78,8 @@ pub struct NacosConfigQuery {
     pub group: Option<String>,
     #[serde(default)]
     pub data_id: Option<String>,
+    #[serde(default)]
+    pub app_name: Option<String>,
     #[serde(default)]
     pub search: Option<String>,
     #[serde(default)]

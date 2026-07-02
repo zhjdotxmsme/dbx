@@ -137,6 +137,69 @@ test("external SQL file paths persist with open query tabs", async () => {
   }
 });
 
+test("clean saved SQL tabs persist without duplicating SQL text", async () => {
+  const restoreStorage = installMemoryStorage();
+  try {
+    setActivePinia(createPinia());
+    let store = useQueryStore();
+    store.openSavedSql({
+      id: "saved-1",
+      connectionId: "conn-1",
+      name: "large.sql",
+      database: "db",
+      sql: "SELECT * FROM large_table;".repeat(100),
+      sqlLoaded: true,
+      createdAt: "2026-06-27T00:00:00.000Z",
+      updatedAt: "2026-06-27T00:00:00.000Z",
+    });
+    store.flushPendingPersist();
+
+    const rawTabs = localStorage.getItem("dbx-open-tabs") ?? "";
+    assert.equal(rawTabs.includes("large_table"), false);
+
+    setActivePinia(createPinia());
+    store = useQueryStore();
+    const tab = store.tabs.find((item) => item.savedSqlId === "saved-1");
+
+    assert.equal(tab?.sql, "");
+    assert.equal(store.isTabDirty(tab!), false);
+  } finally {
+    restoreStorage();
+  }
+});
+
+test("dirty saved SQL tabs keep unsaved edits in open tab persistence", async () => {
+  const restoreStorage = installMemoryStorage();
+  try {
+    setActivePinia(createPinia());
+    let store = useQueryStore();
+    const tabId = store.openSavedSql({
+      id: "saved-1",
+      connectionId: "conn-1",
+      name: "draft.sql",
+      database: "db",
+      sql: "SELECT 1;",
+      sqlLoaded: true,
+      createdAt: "2026-06-27T00:00:00.000Z",
+      updatedAt: "2026-06-27T00:00:00.000Z",
+    });
+    store.updateSql(tabId, "SELECT 2;");
+    store.flushPendingPersist();
+
+    const rawTabs = localStorage.getItem("dbx-open-tabs") ?? "";
+    assert.equal(rawTabs.includes("SELECT 2;"), true);
+
+    setActivePinia(createPinia());
+    store = useQueryStore();
+    const tab = store.tabs.find((item) => item.savedSqlId === "saved-1");
+
+    assert.equal(tab?.sql, "SELECT 2;");
+    assert.equal(store.isTabDirty(tab!), true);
+  } finally {
+    restoreStorage();
+  }
+});
+
 test("marked-clean object source tabs close without unsaved confirmation", () => {
   setActivePinia(createPinia());
   const store = useQueryStore();
@@ -1790,7 +1853,7 @@ test("agent-session query export raises maxRows to the configured export limit",
   setActivePinia(createPinia());
   const connectionStore = useConnectionStore();
   const settingsStore = useSettingsStore();
-  settingsStore.updateEditorSettings({ exportRowLimit: 50_000 });
+  settingsStore.updateEditorSettings({ exportRowLimit: 50_000, exportRowLimitEnabled: true });
   const store = useQueryStore();
   const originalFetch = globalThis.fetch;
   const executeBodies: any[] = [];
@@ -1856,6 +1919,83 @@ test("agent-session query export raises maxRows to the configured export limit",
       assert.equal(body.maxRows, 50_000);
     }
     assert.equal(exported?.rows.length, 20_000);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
+test("query export stops at the configured row limit when enabled", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const connectionStore = useConnectionStore();
+  const settingsStore = useSettingsStore();
+  settingsStore.updateEditorSettings({ exportRowLimit: 15_000, exportRowLimitEnabled: true });
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+  const planLimits: number[] = [];
+  const executeMaxRows: number[] = [];
+
+  connectionStore.addEphemeralConnection(conn("conn-1"));
+  const tabId = store.createTab("conn-1", "analytics", "Query", "query", "public");
+  const tab = store.tabs.find((item) => item.id === tabId);
+  assert.ok(tab);
+  tab.lastExecutedSql = "SELECT * FROM events";
+  tab.result = {
+    columns: ["id"],
+    rows: [[1]],
+    affected_rows: 0,
+    execution_time_ms: 1,
+    truncated: false,
+    has_more: true,
+  };
+
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
+    const url = String(input);
+    if (url === "/api/query/prepare-pagination-plan") {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      const pagination = body.options.pagination;
+      planLimits.push(pagination.limit);
+      return new Response(
+        JSON.stringify({
+          sqlToExecute: `SELECT * FROM events LIMIT ${pagination.limit} OFFSET ${pagination.offset}`,
+          pageLimit: pagination.limit,
+          pageOffset: pagination.offset,
+          useAgentResultSession: false,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url === "/api/query/execute-multi") {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      executeMaxRows.push(body.maxRows);
+      const start = executeMaxRows.length === 1 ? 1 : 10_001;
+      return new Response(
+        JSON.stringify([
+          {
+            columns: ["id"],
+            rows: Array.from({ length: body.maxRows }, (_, index) => [start + index]),
+            affected_rows: 0,
+            execution_time_ms: 1,
+            has_more: true,
+          },
+        ]),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url === "/api/query/close-client-session") {
+      return new Response(JSON.stringify(true), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response("unexpected request", { status: 500 });
+  });
+
+  try {
+    const exported = await store.fetchTabResultForExport(tabId);
+
+    assert.deepEqual(planLimits, [10_000, 5_000]);
+    assert.deepEqual(executeMaxRows, [10_000, 5_000]);
+    assert.equal(exported?.rows.length, 15_000);
+    assert.deepEqual(exported?.rows.at(-1), [15_000]);
   } finally {
     globalThis.fetch = originalFetch;
     restoreStorage();
@@ -1955,6 +2095,45 @@ test("buildQueryResultExportRequest uses exportRowLimit when enabled", async () 
 
     assert.equal(request?.pageSize, 2500);
     assert.equal(request?.rowLimit, 200000);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
+test("buildQueryResultExportRequest caps progress total when export row limit is enabled", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const connectionStore = useConnectionStore();
+  const settingsStore = useSettingsStore();
+  settingsStore.updateEditorSettings({ exportBatchSize: 2500, exportRowLimit: 100000, exportRowLimitEnabled: true });
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+
+  connectionStore.addEphemeralConnection(conn("conn-1"));
+  const tabId = store.createTab("conn-1", "analytics", "Query", "query", "public");
+  const tab = store.tabs.find((item) => item.id === tabId);
+  assert.ok(tab);
+  tab.lastExecutedSql = "SELECT * FROM events";
+  tab.resultTotalRowCount = 120000;
+  tab.result = {
+    columns: ["id"],
+    rows: [[1]],
+    affected_rows: 0,
+    execution_time_ms: 1,
+  };
+
+  globalThis.fetch = withConnectionHealthMock(async () => new Response("unexpected request", { status: 500 }));
+
+  try {
+    const request = await store.buildQueryResultExportRequest(tabId, {
+      exportId: "export-3",
+      filePath: "C:\\tmp\\events.csv",
+      format: "csv",
+    });
+
+    assert.equal(request?.rowLimit, 100000);
+    assert.equal(request?.totalRows, 100000);
   } finally {
     globalThis.fetch = originalFetch;
     restoreStorage();
@@ -2287,6 +2466,92 @@ test("multi statement execution shows the first result set by default", async ()
   }
 });
 
+test("query results keep readable table source labels with active database context", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const connectionStore = useConnectionStore();
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+  let currentSql = "";
+
+  connectionStore.addEphemeralConnection({ ...conn("conn-1"), database: "aaa" });
+  const tabId = store.createTab("conn-1", "db", "Query");
+  const defaultDatabaseTabId = store.createTab("conn-1", "", "Default database query");
+
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
+    const url = String(input);
+    if (url === "/api/query/prepare-pagination-plan") {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      currentSql = body.options.sql;
+      return new Response(JSON.stringify({ sqlToExecute: currentSql, useAgentResultSession: false }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (url === "/api/query/execute-multi") {
+      const results =
+        currentSql === "select * from users; select * from orders"
+          ? [
+              { columns: ["id"], rows: [[1]], affected_rows: 0, execution_time_ms: 1 },
+              { columns: ["id"], rows: [[2]], affected_rows: 0, execution_time_ms: 1 },
+            ]
+          : currentSql === "SELECT *\nFROM apis AS ap\nLIMIT 10;\n\nSELECT *\nFROM menus AS mn\nLIMIT 10;"
+            ? [
+                { columns: ["id"], rows: [[1]], affected_rows: 0, execution_time_ms: 1 },
+                { columns: ["id"], rows: [[2]], affected_rows: 0, execution_time_ms: 1 },
+              ]
+          : currentSql === "select * from public.users"
+            ? [{ columns: ["id"], rows: [[1]], affected_rows: 0, execution_time_ms: 1 }]
+            : currentSql === "select u.id from users u join orders o on o.user_id = u.id"
+              ? [{ columns: ["id"], rows: [[1]], affected_rows: 0, execution_time_ms: 1 }]
+              : [
+                  { columns: [], rows: [], affected_rows: 1, execution_time_ms: 1 },
+                  { columns: ["id"], rows: [[1]], affected_rows: 0, execution_time_ms: 1 },
+                ];
+      return new Response(JSON.stringify(results), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    if (url === "/api/query/analyze-editability") {
+      return new Response(JSON.stringify({ editable: false, reason: "complex-source" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("unexpected request", { status: 500 });
+  });
+
+  try {
+    await store.executeTabSql(tabId, "select * from users; select * from orders");
+    let tab = store.tabs.find((item) => item.id === tabId);
+    assert.deepEqual(tab?.results?.map((result) => result.sourceLabel), ["db.users", "db.orders"]);
+    assert.deepEqual(tab?.results?.map((result) => result.sourceStatement), ["select * from users", "select * from orders"]);
+
+    await store.executeTabSql(
+      defaultDatabaseTabId,
+      "SELECT *\nFROM apis AS ap\nLIMIT 10;\n\nSELECT *\nFROM menus AS mn\nLIMIT 10;",
+    );
+    tab = store.tabs.find((item) => item.id === defaultDatabaseTabId);
+    assert.deepEqual(tab?.results?.map((result) => result.sourceLabel), ["aaa.apis", "aaa.menus"]);
+
+    await store.executeTabSql(tabId, "select * from public.users");
+    tab = store.tabs.find((item) => item.id === tabId);
+    assert.equal(tab?.result?.sourceLabel, "public.users");
+
+    await store.executeTabSql(tabId, "select u.id from users u join orders o on o.user_id = u.id");
+    tab = store.tabs.find((item) => item.id === tabId);
+    assert.equal(tab?.result?.sourceLabel, undefined);
+    assert.equal(tab?.result?.sourceStatement, "select u.id from users u join orders o on o.user_id = u.id");
+
+    await store.executeTabSql(tabId, "update users set active = true; select * from users");
+    tab = store.tabs.find((item) => item.id === tabId);
+    assert.equal(tab?.results?.[0]?.sourceLabel, undefined);
+    assert.equal(tab?.results?.[1]?.sourceLabel, "db.users");
+    assert.equal(tab?.results?.[1]?.sourceStatement, "select * from users");
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
 test("tab reuse is scoped by mode and schema instead of title alone", () => {
   const restoreStorage = installMemoryStorage();
   try {
@@ -2339,6 +2604,44 @@ test("table structure refresh versions are scoped by table target", () => {
   assert.equal(store.tableStructureRefreshVersion("conn-1", "db", "public", "users"), 2);
   assert.equal(store.tableStructureRefreshVersion("conn-1", "db", undefined, "users"), 1);
   assert.equal(store.tableStructureRefreshVersion("conn-1", "db", "public", "orders"), 0);
+});
+
+test("duplicating a table structure tab clones its unsaved draft", () => {
+  setActivePinia(createPinia());
+  const store = useQueryStore();
+
+  const tabId = store.openTableStructure("conn-1", "db", "public", "users");
+  const tab = store.tabs.find((item) => item.id === tabId)!;
+  tab.structureDraft = {
+    activeTab: "columns",
+    newTableName: "",
+    tableComment: "",
+    originalTableComment: "",
+    columns: [
+      {
+        id: "new:1",
+        name: "draft_name",
+        dataType: "varchar(255)",
+        isNullable: true,
+        defaultValue: "",
+        comment: "",
+        isPrimaryKey: false,
+        extra: {},
+        markedForDrop: false,
+      },
+    ],
+    indexes: [],
+    foreignKeys: [],
+    triggers: [],
+    initialized: true,
+  };
+
+  store.duplicateTab(tabId);
+
+  const copy = store.tabs.find((item) => item.id !== tabId && item.mode === "structure")!;
+  assert.deepEqual(copy.structureDraft, tab.structureDraft);
+  copy.structureDraft!.columns[0]!.name = "copy_only";
+  assert.equal(tab.structureDraft.columns[0]!.name, "draft_name");
 });
 
 test("reorderTab keeps pinned tabs before unpinned tabs after reorder", () => {

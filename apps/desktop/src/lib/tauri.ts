@@ -31,10 +31,21 @@ import type {
   SavedSqlFolder,
   SavedSqlLibrary,
 } from "@/types/database";
+import type { CollectionInfo } from "@/types/database";
 import type { SidebarObjectKind } from "@/lib/databaseObjectCapabilities";
 import type { AiConfig, AiTestConnectionResult } from "@/stores/settingsStore";
 import type { QueryEditability } from "@/lib/sqlAnalysis";
-import type { DataGridColumnValueFilterConditionOptions, DataGridContextFilterConditionOptions, DataGridCountSqlOptions, DataGridCopyInsertStatementOptions, DataGridCopyUpdateStatementOptions, DataGridSaveStatementOptions, HiveTablePropertiesSqlOptions } from "@/lib/dataGridSql";
+import type {
+  DataGridColumnDistinctValuesSqlOptions,
+  DataGridColumnValueFilterConditionOptions,
+  DataGridColumnValuesFilterConditionOptions,
+  DataGridContextFilterConditionOptions,
+  DataGridCountSqlOptions,
+  DataGridCopyInsertStatementOptions,
+  DataGridCopyUpdateStatementOptions,
+  DataGridSaveStatementOptions,
+  HiveTablePropertiesSqlOptions,
+} from "@/lib/dataGridSql";
 import type { DataCompareFromTablesOptions, DataCompareFromTablesPreparation, DataCompareSyncPlan, DataCompareSyncPlanOptions, DataComparePreparation, DataComparePreparationOptions } from "@/lib/dataCompare";
 import type { SchemaDiffPreparation, SchemaDiffPreparationOptions, TableDiff, FunctionDiff, SequenceDiff, RuleDiff, OwnerDiff } from "@/lib/schemaDiff";
 import type { BuildTableStructureChangeSqlOptions, BuildSingleColumnAlterSqlOptions, TableStructureChangeSql } from "@/lib/tableStructureEditorSql";
@@ -251,10 +262,17 @@ export interface AiMessage {
   content: string;
 }
 
+export interface AiTaskContract {
+  action?: string;
+  mode?: string;
+  userRequest?: string;
+}
+
 export interface AiCompletionRequest {
   config: AiConfig;
   systemPrompt: string;
   messages: AiMessage[];
+  taskContract?: AiTaskContract;
   maxTokens?: number;
   temperature?: number;
 }
@@ -549,8 +567,8 @@ export async function getObjectSource(connectionId: string, database: string, sc
   return invoke("get_object_source", { connectionId, database, schema, name, objectType });
 }
 
-export async function listSchemas(connectionId: string, database: string): Promise<string[]> {
-  return invoke("list_schemas", { connectionId, database });
+export async function listSchemas(connectionId: string, database: string, applyVisibleFilter = false): Promise<string[]> {
+  return invoke("list_schemas", { connectionId, database, applyVisibleFilter });
 }
 
 export async function listSchemaInfos(connectionId: string, database: string): Promise<SchemaInfo[]> {
@@ -559,6 +577,10 @@ export async function listSchemaInfos(connectionId: string, database: string): P
 
 export async function getColumns(connectionId: string, database: string, schema: string, table: string): Promise<ColumnInfo[]> {
   return invoke("get_columns", { connectionId, database, schema, table });
+}
+
+export async function listDataTypes(connectionId: string, database: string): Promise<string[]> {
+  return invoke("list_data_types", { connectionId, database });
 }
 
 export async function executeQuery(
@@ -788,6 +810,15 @@ export async function buildDataGridContextFilterCondition(options: DataGridConte
 export async function buildDataGridColumnValueFilterCondition(options: DataGridColumnValueFilterConditionOptions): Promise<string | undefined> {
   const result = await invoke<string | null>("build_data_grid_column_value_filter_condition", { options });
   return result ?? undefined;
+}
+
+export async function buildDataGridColumnValuesFilterCondition(options: DataGridColumnValuesFilterConditionOptions): Promise<string | undefined> {
+  const result = await invoke<string | null>("build_data_grid_column_values_filter_condition", { options });
+  return result ?? undefined;
+}
+
+export async function buildDataGridColumnDistinctValuesSql(options: DataGridColumnDistinctValuesSqlOptions): Promise<string> {
+  return invoke("build_data_grid_column_distinct_values_sql", { options });
 }
 
 export async function buildDataGridCountSql(options: DataGridCountSqlOptions): Promise<string> {
@@ -1032,6 +1063,10 @@ export async function loadSavedSqlLibrary(): Promise<SavedSqlLibrary> {
   return invoke("load_saved_sql_library");
 }
 
+export async function loadSavedSqlFile(id: string): Promise<SavedSqlFile | null> {
+  return invoke("load_saved_sql_file", { id });
+}
+
 export async function saveSavedSqlFolder(folder: SavedSqlFolder): Promise<SavedSqlFolder> {
   return invoke("save_saved_sql_folder", { folder });
 }
@@ -1091,6 +1126,13 @@ export interface UpdateInfo {
   release_notes: string;
 }
 
+export type UpdateDownloadSource = "official" | "cnb";
+
+export interface UpdateDownloadProgress {
+  downloaded: number;
+  total: number | null;
+}
+
 export interface McpServerStatus {
   installed: boolean;
   npm_available: boolean;
@@ -1118,6 +1160,10 @@ export async function checkForUpdates(): Promise<UpdateInfo> {
 
 export async function getSystemProxyUrl(): Promise<string | null> {
   return invoke("get_system_proxy_url");
+}
+
+export async function downloadAndInstallUpdate(source: UpdateDownloadSource, latestVersion?: string): Promise<void> {
+  return invoke("download_and_install_update", { source, latestVersion });
 }
 
 export async function getAppVersion(): Promise<string> {
@@ -1323,6 +1369,10 @@ export interface KvListPrefixResponse {
   revision?: number | null;
 }
 
+export interface KvListPrefixOptions {
+  recursive?: boolean | null;
+}
+
 export interface KvGetResponse {
   found: boolean;
   key?: string | null;
@@ -1368,8 +1418,8 @@ export async function etcdDelete(connectionId: string, key: string): Promise<KvD
 }
 
 // --- ZooKeeper ---
-export async function zookeeperListPrefix(connectionId: string, prefix: string, limit: number, continuation?: string | null): Promise<KvListPrefixResponse> {
-  return invoke("zookeeper_list_prefix", { connectionId, prefix, limit, continuation });
+export async function zookeeperListPrefix(connectionId: string, prefix: string, limit: number, continuation?: string | null, options?: KvListPrefixOptions | null): Promise<KvListPrefixResponse> {
+  return invoke("zookeeper_list_prefix", { connectionId, prefix, limit, continuation, recursive: options?.recursive ?? null });
 }
 
 export async function zookeeperGet(connectionId: string, key: string): Promise<KvGetResponse> {
@@ -1394,7 +1444,7 @@ export async function mongoListDatabases(connectionId: string): Promise<string[]
   return invoke("mongo_list_databases", { connectionId });
 }
 
-export async function mongoListCollections(connectionId: string, database: string): Promise<string[]> {
+export async function mongoListCollections(connectionId: string, database: string): Promise<CollectionInfo[]> {
   return invoke("mongo_list_collections", { connectionId, database });
 }
 
@@ -1411,19 +1461,24 @@ export async function mongoDropCollection(connectionId: string, database: string
 }
 
 export async function elasticsearchListIndices(connectionId: string): Promise<string[]> {
-  return mongoListCollections(connectionId, "default");
+  const collections = await mongoListCollections(connectionId, "default");
+  return collections.map((c) => c.name);
 }
 
-export async function vectorListCollections(connectionId: string): Promise<string[]> {
-  return mongoListCollections(connectionId, "default");
+export async function vectorListCollections(connectionId: string, database?: string): Promise<CollectionInfo[]> {
+  return mongoListCollections(connectionId, database || "default");
 }
 
-export async function mongoFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, sort?: string, executionId?: string): Promise<MongoDocumentResult> {
-  return invoke("mongo_find_documents", { connectionId, database, collection, skip, limit, filter, sort, executionId });
+export async function mongoFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, executionId?: string): Promise<MongoDocumentResult> {
+  return invoke("mongo_find_documents", { connectionId, database, collection, skip, limit, filter, projection, sort, executionId });
 }
 
-export async function documentFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, sort?: string, executionId?: string): Promise<MongoDocumentResult> {
-  return invoke("document_find_documents", { connectionId, database, collection, skip, limit, filter, sort, executionId });
+export async function documentFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, executionId?: string): Promise<MongoDocumentResult> {
+  return invoke("document_find_documents", { connectionId, database, collection, skip, limit, filter, projection, sort, executionId });
+}
+
+export async function mongoServerVersion(connectionId: string, database: string, executionId?: string): Promise<string> {
+  return invoke("mongo_server_version", { connectionId, database, executionId });
 }
 
 export async function mongoAggregateDocuments(connectionId: string, database: string, collection: string, pipelineJson: string, maxRows?: number, executionId?: string): Promise<MongoDocumentResult> {
@@ -1598,7 +1653,7 @@ export async function startTransfer(request: TransferRequest, onProgress: (progr
         unlisten = await listen<TransferProgress>("transfer-progress", (event) => {
           if (event.payload.transferId !== request.transferId) return;
           onProgress(event.payload);
-          if (event.payload.status === "done" || event.payload.status === "cancelled") {
+          if (event.payload.status === "done" || event.payload.status === "error" || event.payload.status === "cancelled") {
             unlisten?.();
             resolve();
           }
@@ -1749,6 +1804,7 @@ export interface TableExportRequest {
   orderBy?: string;
   skipCount?: boolean;
   batchSize?: number;
+  rowLimit?: number | null;
 }
 
 export interface TableCsvExportOptions {

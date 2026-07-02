@@ -6,6 +6,7 @@ import { z } from "zod";
 import {
   buildSchemaContext,
   createBackend,
+  evaluateRedisCommandSafety,
   evaluateMongoAggregateSafety,
   evaluateSqlSafety,
   formatCell,
@@ -20,6 +21,7 @@ import {
   type Backend,
   type ConnectionConfig,
   type QueryResult,
+  type RedisCommandResult,
 } from "@dbx-app/node-core";
 
 const require = createRequire(import.meta.url);
@@ -45,8 +47,28 @@ function formatQueryToolResult(result: QueryResult, title?: string) {
   return text(`${prefix}${mdTable(result.columns, rows)}\n\n${result.row_count} row(s)`);
 }
 
+function redisDbFromValue(value?: string): number | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  const db = Number(trimmed);
+  return Number.isInteger(db) && db >= 0 ? db : undefined;
+}
+
+function defaultRedisDb(config: ConnectionConfig, scope: McpScope, db?: number): number {
+  return db ?? redisDbFromValue(scope.database) ?? redisDbFromValue(config.database) ?? 0;
+}
+
+function formatRedisCommandValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  return JSON.stringify(value, null, 2) ?? String(value);
+}
+
+function formatRedisCommandToolResult(result: RedisCommandResult) {
+  return text(`Command: ${result.command}\nSafety: ${result.safety}\n\n${formatRedisCommandValue(result.value)}`);
+}
+
 export const DBX_CONNECTION_TYPE_DESCRIPTION =
-  "Database type: postgres, mysql, sqlite, rqlite, redis, duckdb, clickhouse, sqlserver, mongodb, oracle, elasticsearch, etcd, doris, starrocks, manticoresearch, milvus, qdrant, weaviate, redshift, dameng, kingbase, highgo, vastbase, goldendb, databend, gaussdb, kwdb, yashandb, databricks, saphana, teradata, vertica, firebird, exasol, opengauss, oceanbase-oracle, questdb, gbase, h2, snowflake, trino, prestosql, hive, db2, informix, influxdb, iris, neo4j, cassandra, bigquery, kylin, sundb, tdengine, iotdb, xugu, zookeeper, jdbc, access, mq";
+  "Database type: postgres, mysql, sqlite, rqlite, redis, duckdb, clickhouse, sqlserver, mongodb, oracle, elasticsearch, etcd, doris, starrocks, manticoresearch, milvus, qdrant, weaviate, chromadb, redshift, dameng, kingbase, highgo, vastbase, goldendb, databend, gaussdb, kwdb, yashandb, databricks, saphana, teradata, vertica, firebird, exasol, opengauss, oceanbase-oracle, questdb, gbase, h2, snowflake, trino, prestosql, hive, db2, informix, influxdb, iris, neo4j, cassandra, bigquery, kylin, sundb, tdengine, iotdb, xugu, zookeeper, jdbc, access, mq";
 const FILE_CAPABLE_CONNECTION_TYPES = new Set(["sqlite", "duckdb", "access", "h2"]);
 
 interface McpScope {
@@ -162,6 +184,12 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
       const { config, error } = await resolveConnection(backend, scope, connection_name);
       if (error) return error;
       const scopedConfig = config!;
+      if (scopedConfig.db_type === "redis") {
+        return toolError(
+          "REDIS_COMMAND_REQUIRED",
+          "Redis connections do not accept SQL through dbx_execute_query. Use dbx_execute_redis_command with a Redis command such as GET key or INFO.",
+        );
+      }
       if (scopedConfig.db_type !== "mongodb") {
         const safety = evaluateSqlSafety(sql, { ...sqlSafetyFromEnv(), allowMultipleStatements: true });
         if (!safety.allowed) return toolError("SQL_BLOCKED", safety.reason ?? "SQL blocked.");
@@ -179,6 +207,38 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         return toolError("QUERY_ERROR", msg);
+      }
+    },
+  );
+
+  server.tool(
+    "dbx_execute_redis_command",
+    "Execute a Redis command on a Redis connection",
+    {
+      connection_name: z.string().optional().describe("Name of the DBX Redis connection"),
+      db: z.number().int().min(0).optional().describe("Redis logical database number (default: scoped/default database or 0)"),
+      command: z.string().describe("Redis command to execute, for example: GET mykey, INFO, or DBSIZE"),
+    },
+    async ({ connection_name, db, command }) => {
+      const { config, error } = await resolveConnection(backend, scope, connection_name);
+      if (error) return error;
+      const scopedConfig = config!;
+      if (scopedConfig.db_type !== "redis") {
+        return toolError("INVALID_CONNECTION_TYPE", `Connection "${scopedConfig.name}" is ${scopedConfig.db_type}, not Redis.`);
+      }
+      if (!backend.executeRedisCommand) {
+        return toolError("UNSUPPORTED_BACKEND", "This DBX backend does not support Redis command execution.");
+      }
+      const safety = evaluateRedisCommandSafety(command, sqlSafetyFromEnv());
+      if (!safety.allowed) return toolError("REDIS_COMMAND_BLOCKED", safety.reason ?? "Redis command blocked.");
+      try {
+        const result = await backend.executeRedisCommand(scopedConfig, defaultRedisDb(scopedConfig, scope, db), command, {
+          skipSafetyCheck: safety.skipSafetyCheck,
+        });
+        return formatRedisCommandToolResult(result);
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return toolError("REDIS_COMMAND_ERROR", msg);
       }
     },
   );

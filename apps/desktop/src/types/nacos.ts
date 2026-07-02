@@ -8,6 +8,7 @@ export interface NacosCapabilities {
 
 export interface NacosConnectionInfo {
   serverAddr: string;
+  displayServerAddr: string;
   namespace: string;
   serverVersion?: string;
   auth: string;
@@ -55,6 +56,7 @@ export interface NacosConfigQuery {
   namespace?: string;
   group?: string;
   dataId?: string;
+  appName?: string;
   search?: string;
   pageNo?: number;
   pageSize?: number;

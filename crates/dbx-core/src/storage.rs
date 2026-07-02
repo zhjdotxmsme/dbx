@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension, ToSql};
+use rusqlite::{params, params_from_iter, Connection, DatabaseName, OpenFlags, OptionalExtension, ToSql};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -17,6 +17,80 @@ use crate::saved_sql::{SavedSqlFile, SavedSqlFolder, SavedSqlLibrary};
 
 const SSH_TUNNEL_SECRET_PREFIX: &str = "ssh_tunnels.";
 const TRANSPORT_LAYER_SECRET_PREFIX: &str = "transport_layers.";
+const STORAGE_DB_FILE_NAME: &str = "dbx.db";
+const USER_DATA_TABLES: &[&str] = &[
+    "connections",
+    "connection_secrets",
+    "history",
+    "ai_conversations",
+    "mq_token_records",
+    "saved_sql_folders",
+    "saved_sql_files",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataDbImportResult {
+    Imported,
+    SkippedNoSource,
+    SkippedInvalidSource,
+    SkippedInvalidTarget,
+    SkippedSourceEmpty,
+    SkippedTargetHasData,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqliteDbFileState {
+    Missing,
+    Empty,
+    Valid,
+    Invalid,
+}
+
+pub fn maybe_import_user_data_db(
+    target_data_dir: &Path,
+    source_data_dir: Option<&Path>,
+) -> Result<DataDbImportResult, String> {
+    let Some(source_data_dir) = source_data_dir else {
+        return Ok(DataDbImportResult::SkippedNoSource);
+    };
+
+    let source_db_path = source_data_dir.join(STORAGE_DB_FILE_NAME);
+    if !source_db_path.is_file() {
+        return Ok(DataDbImportResult::SkippedNoSource);
+    }
+    if inspect_sqlite_db_file(&source_db_path)? != SqliteDbFileState::Valid {
+        return Ok(DataDbImportResult::SkippedInvalidSource);
+    }
+
+    let source_conn = open_read_only_sqlite(&source_db_path)?;
+    if !sqlite_db_has_user_data(&source_conn)? {
+        return Ok(DataDbImportResult::SkippedSourceEmpty);
+    }
+
+    let target_db_path = target_data_dir.join(STORAGE_DB_FILE_NAME);
+    match inspect_sqlite_db_file(&target_db_path)? {
+        SqliteDbFileState::Missing => {}
+        SqliteDbFileState::Empty => {
+            remove_sqlite_db_files(&target_db_path)?;
+        }
+        SqliteDbFileState::Valid => {
+            let target_conn = open_read_only_sqlite(&target_db_path)?;
+            if sqlite_db_has_user_data(&target_conn)? {
+                return Ok(DataDbImportResult::SkippedTargetHasData);
+            }
+            drop(target_conn);
+            remove_sqlite_db_files(&target_db_path)?;
+        }
+        SqliteDbFileState::Invalid => return Ok(DataDbImportResult::SkippedInvalidTarget),
+    }
+
+    std::fs::create_dir_all(target_data_dir).map_err(|e| format!("Failed to create data dir: {e}"))?;
+    source_conn
+        .backup(DatabaseName::Main, &target_db_path, None)
+        .map_err(|e| format!("Failed to import user data db: {e}"))?;
+
+    Ok(DataDbImportResult::Imported)
+}
 
 pub struct Storage {
     db: SqliteHandle,
@@ -222,6 +296,64 @@ impl Storage {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || db.with_connection(f)).await.map_err(|e| e.to_string())?
     }
+}
+
+fn inspect_sqlite_db_file(path: &Path) -> Result<SqliteDbFileState, String> {
+    if !path.exists() {
+        return Ok(SqliteDbFileState::Missing);
+    }
+
+    let metadata = path.metadata().map_err(|e| format!("Failed to inspect db file: {e}"))?;
+    if metadata.len() == 0 {
+        return Ok(SqliteDbFileState::Empty);
+    }
+
+    if crate::db::sqlite::path_has_sqlite_header(path)? {
+        Ok(SqliteDbFileState::Valid)
+    } else {
+        Ok(SqliteDbFileState::Invalid)
+    }
+}
+
+fn open_read_only_sqlite(path: &Path) -> Result<Connection, String> {
+    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| format!("Failed to open db read-only: {e}"))
+}
+
+fn sqlite_db_has_user_data(conn: &Connection) -> Result<bool, String> {
+    for table_name in USER_DATA_TABLES {
+        if sqlite_table_has_rows(conn, table_name)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn sqlite_table_has_rows(conn: &Connection, table_name: &str) -> Result<bool, String> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [table_name],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if !exists {
+        return Ok(false);
+    }
+
+    let sql = format!("SELECT EXISTS(SELECT 1 FROM {table_name} LIMIT 1)");
+    conn.query_row(&sql, [], |row| row.get(0)).map_err(|e| e.to_string())
+}
+
+fn remove_sqlite_db_files(db_path: &Path) -> Result<(), String> {
+    for path in [db_path.to_path_buf(), db_path.with_extension("db-wal"), db_path.with_extension("db-shm")] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(format!("Failed to remove empty target db file {}: {err}", path.display())),
+        }
+    }
+    Ok(())
 }
 
 fn ensure_history_columns_sync(conn: &Connection) -> Result<(), String> {
@@ -1146,6 +1278,7 @@ impl Storage {
                         database: row.get(4)?,
                         schema: row.get(5)?,
                         sql: row.get(6)?,
+                        sql_loaded: true,
                         order_index: row.get(7)?,
                         open_count: row.get(8)?,
                         opened_at: row.get(9)?,
@@ -1158,6 +1291,97 @@ impl Storage {
                 .map_err(|e| e.to_string())?;
 
             Ok(SavedSqlLibrary { folders, files })
+        })
+        .await
+    }
+
+    pub async fn load_saved_sql_library_summary(&self) -> Result<SavedSqlLibrary, String> {
+        self.with_conn(|conn| {
+            let mut folder_stmt = conn
+                .prepare(
+                    "SELECT id, connection_id, parent_folder_id, name, order_index, created_at, updated_at \
+                     FROM saved_sql_folders ORDER BY COALESCE(parent_folder_id, ''), order_index, connection_id, name COLLATE NOCASE",
+                )
+                .map_err(|e| e.to_string())?;
+            let folders = folder_stmt
+                .query_map([], |row| {
+                    Ok(SavedSqlFolder {
+                        id: row.get(0)?,
+                        connection_id: row.get(1)?,
+                        parent_folder_id: row.get(2)?,
+                        name: row.get(3)?,
+                        order_index: row.get(4)?,
+                        created_at: row.get(5)?,
+                        updated_at: row.get(6)?,
+                    })
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+
+            let mut file_stmt = conn
+                .prepare(
+                    "SELECT id, connection_id, folder_id, name, database_name, schema_name, order_index, open_count, opened_at, created_at, updated_at \
+                     FROM saved_sql_files ORDER BY COALESCE(folder_id, ''), order_index, connection_id, name COLLATE NOCASE",
+                )
+                .map_err(|e| e.to_string())?;
+            let files = file_stmt
+                .query_map([], |row| {
+                    Ok(SavedSqlFile {
+                        id: row.get(0)?,
+                        connection_id: row.get(1)?,
+                        folder_id: row.get(2)?,
+                        name: row.get(3)?,
+                        database: row.get(4)?,
+                        schema: row.get(5)?,
+                        sql: String::new(),
+                        sql_loaded: false,
+                        order_index: row.get(6)?,
+                        open_count: row.get(7)?,
+                        opened_at: row.get(8)?,
+                        created_at: row.get(9)?,
+                        updated_at: row.get(10)?,
+                    })
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+
+            Ok(SavedSqlLibrary { folders, files })
+        })
+        .await
+    }
+
+    pub async fn load_saved_sql_file(&self, id: &str) -> Result<Option<SavedSqlFile>, String> {
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, connection_id, folder_id, name, database_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at \
+                     FROM saved_sql_files WHERE id = ?1",
+                )
+                .map_err(|e| e.to_string())?;
+            match stmt.query_row([id], |row| {
+                Ok(SavedSqlFile {
+                    id: row.get(0)?,
+                    connection_id: row.get(1)?,
+                    folder_id: row.get(2)?,
+                    name: row.get(3)?,
+                    database: row.get(4)?,
+                    schema: row.get(5)?,
+                    sql: row.get(6)?,
+                    sql_loaded: true,
+                    order_index: row.get(7)?,
+                    open_count: row.get(8)?,
+                    opened_at: row.get(9)?,
+                    created_at: row.get(10)?,
+                    updated_at: row.get(11)?,
+                })
+            }) {
+                Ok(file) => Ok(Some(file)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(err) => Err(err.to_string()),
+            }
         })
         .await
     }
@@ -1233,7 +1457,7 @@ impl Storage {
                  name = excluded.name, \
                  database_name = excluded.database_name, \
                  schema_name = excluded.schema_name, \
-                 sql_text = excluded.sql_text, \
+                 sql_text = CASE WHEN ?13 THEN excluded.sql_text ELSE saved_sql_files.sql_text END, \
                  order_index = excluded.order_index, \
                  open_count = excluded.open_count, \
                  opened_at = excluded.opened_at, \
@@ -1250,7 +1474,8 @@ impl Storage {
                     file.open_count,
                     file.opened_at,
                     file.created_at,
-                    file.updated_at
+                    file.updated_at,
+                    file.sql_loaded
                 ],
             )
             .map(|_| ())
@@ -1863,14 +2088,20 @@ fn map_from_sql_err(err: serde_json::Error) -> rusqlite::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{DesktopIconTheme, DesktopSettings, Storage};
+    use super::{maybe_import_user_data_db, DataDbImportResult, DesktopIconTheme, DesktopSettings, Storage};
     use crate::connection_secrets::{MQ_AUTH_PASSWORD_KEY, MQ_AUTH_TOKEN_KEY, MQ_TOKEN_SIGNING_KEY};
     use crate::models::connection::{ConnectionConfig, DatabaseType};
+    use crate::saved_sql::SavedSqlFile;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_db_path(name: &str) -> std::path::PathBuf {
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         std::env::temp_dir().join(format!("dbx-storage-{name}-{}-{stamp}.db", std::process::id()))
+    }
+
+    fn temp_data_dir(name: &str) -> std::path::PathBuf {
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        std::env::temp_dir().join(format!("dbx-storage-{name}-{}-{stamp}", std::process::id()))
     }
 
     fn mq_connection(id: &str, token: &str) -> ConnectionConfig {
@@ -1910,6 +2141,7 @@ mod tests {
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
             redis_key_separator: ":".to_string(),
+            redis_scan_page_size: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -1958,6 +2190,93 @@ mod tests {
 
     fn mq_token_signing_key(config: &ConnectionConfig) -> Option<&str> {
         config.external_config.as_ref()?.get("tokenSigning")?.get("key")?.as_str()
+    }
+
+    async fn create_data_dir_with_connection(name: &str, connection_id: &str, token: &str) -> std::path::PathBuf {
+        let data_dir = temp_data_dir(name);
+        let storage = Storage::open(&data_dir.join("dbx.db")).await.unwrap();
+        storage.save_connections(&[mq_connection(connection_id, token)]).await.unwrap();
+        drop(storage);
+        data_dir
+    }
+
+    #[tokio::test]
+    async fn import_user_data_db_copies_source_when_target_is_missing() {
+        let source_dir = create_data_dir_with_connection("import-source", "source-connection", "source-token").await;
+        let target_dir = temp_data_dir("import-target");
+
+        let result = maybe_import_user_data_db(&target_dir, Some(&source_dir)).unwrap();
+
+        assert_eq!(result, DataDbImportResult::Imported);
+        let storage = Storage::open(&target_dir.join("dbx.db")).await.unwrap();
+        let connections = storage.load_connections().await.unwrap();
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].id, "source-connection");
+        assert_eq!(mq_token(&connections[0]), Some("source-token"));
+    }
+
+    #[tokio::test]
+    async fn import_user_data_db_does_not_overwrite_target_with_user_data() {
+        let source_dir =
+            create_data_dir_with_connection("import-source-existing", "source-connection", "source-token").await;
+        let target_dir =
+            create_data_dir_with_connection("import-target-existing", "target-connection", "target-token").await;
+
+        let result = maybe_import_user_data_db(&target_dir, Some(&source_dir)).unwrap();
+
+        assert_eq!(result, DataDbImportResult::SkippedTargetHasData);
+        let storage = Storage::open(&target_dir.join("dbx.db")).await.unwrap();
+        let connections = storage.load_connections().await.unwrap();
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].id, "target-connection");
+        assert_eq!(mq_token(&connections[0]), Some("target-token"));
+    }
+
+    #[tokio::test]
+    async fn import_user_data_db_replaces_empty_target_schema() {
+        let source_dir =
+            create_data_dir_with_connection("import-source-empty-target", "source-connection", "source-token").await;
+        let target_dir = temp_data_dir("import-empty-target");
+        let target_storage = Storage::open(&target_dir.join("dbx.db")).await.unwrap();
+        target_storage
+            .save_desktop_settings(&DesktopSettings { debug_logging_enabled: true, ..DesktopSettings::default() })
+            .await
+            .unwrap();
+        drop(target_storage);
+
+        let result = maybe_import_user_data_db(&target_dir, Some(&source_dir)).unwrap();
+
+        assert_eq!(result, DataDbImportResult::Imported);
+        let storage = Storage::open(&target_dir.join("dbx.db")).await.unwrap();
+        let connections = storage.load_connections().await.unwrap();
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].id, "source-connection");
+    }
+
+    #[tokio::test]
+    async fn import_user_data_db_skips_empty_source_schema() {
+        let source_dir = temp_data_dir("import-empty-source");
+        let source_storage = Storage::open(&source_dir.join("dbx.db")).await.unwrap();
+        drop(source_storage);
+        let target_dir = temp_data_dir("import-empty-source-target");
+
+        let result = maybe_import_user_data_db(&target_dir, Some(&source_dir)).unwrap();
+
+        assert_eq!(result, DataDbImportResult::SkippedSourceEmpty);
+        assert!(!target_dir.join("dbx.db").exists());
+    }
+
+    #[test]
+    fn import_user_data_db_skips_invalid_source_file() {
+        let source_dir = temp_data_dir("import-invalid-source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(source_dir.join("dbx.db"), b"not sqlite").unwrap();
+        let target_dir = temp_data_dir("import-invalid-source-target");
+
+        let result = maybe_import_user_data_db(&target_dir, Some(&source_dir)).unwrap();
+
+        assert_eq!(result, DataDbImportResult::SkippedInvalidSource);
+        assert!(!target_dir.join("dbx.db").exists());
     }
 
     #[tokio::test]
@@ -2239,5 +2558,70 @@ mod tests {
 
         storage.delete_tab_runtime_cache("tab:1:result").await.unwrap();
         assert_eq!(storage.load_tab_runtime_cache("tab:1:result").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn saved_sql_summary_omits_sql_text_and_loads_file_on_demand() {
+        let path = temp_db_path("saved-sql-summary");
+        let storage = Storage::open(&path).await.unwrap();
+        let file = SavedSqlFile {
+            id: "sql-1".to_string(),
+            connection_id: "conn-1".to_string(),
+            folder_id: None,
+            name: "large.sql".to_string(),
+            database: "main".to_string(),
+            schema: None,
+            sql: "SELECT * FROM very_large_table;".repeat(100),
+            sql_loaded: true,
+            order_index: 0,
+            open_count: 0,
+            opened_at: None,
+            created_at: "2026-06-27T00:00:00Z".to_string(),
+            updated_at: "2026-06-27T00:00:00Z".to_string(),
+        };
+
+        storage.save_saved_sql_file(&file).await.unwrap();
+
+        let summary = storage.load_saved_sql_library_summary().await.unwrap();
+        assert_eq!(summary.files.len(), 1);
+        assert_eq!(summary.files[0].sql, "");
+        assert!(!summary.files[0].sql_loaded);
+
+        let loaded = storage.load_saved_sql_file("sql-1").await.unwrap().unwrap();
+        assert_eq!(loaded.sql, file.sql);
+        assert!(loaded.sql_loaded);
+    }
+
+    #[tokio::test]
+    async fn saved_sql_metadata_update_preserves_unloaded_sql_text() {
+        let path = temp_db_path("saved-sql-preserve-unloaded-text");
+        let storage = Storage::open(&path).await.unwrap();
+        let mut file = SavedSqlFile {
+            id: "sql-1".to_string(),
+            connection_id: "conn-1".to_string(),
+            folder_id: None,
+            name: "query.sql".to_string(),
+            database: "main".to_string(),
+            schema: None,
+            sql: "SELECT 1;".to_string(),
+            sql_loaded: true,
+            order_index: 0,
+            open_count: 0,
+            opened_at: None,
+            created_at: "2026-06-27T00:00:00Z".to_string(),
+            updated_at: "2026-06-27T00:00:00Z".to_string(),
+        };
+        storage.save_saved_sql_file(&file).await.unwrap();
+
+        file.name = "renamed.sql".to_string();
+        file.sql.clear();
+        file.sql_loaded = false;
+        file.open_count = 1;
+        storage.save_saved_sql_file(&file).await.unwrap();
+
+        let loaded = storage.load_saved_sql_file("sql-1").await.unwrap().unwrap();
+        assert_eq!(loaded.name, "renamed.sql");
+        assert_eq!(loaded.open_count, 1);
+        assert_eq!(loaded.sql, "SELECT 1;");
     }
 }

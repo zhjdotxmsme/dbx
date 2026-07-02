@@ -29,6 +29,7 @@ import { useDataGridActions } from "@/composables/useDataGridActions";
 import { useTauriEvents } from "@/composables/useTauriEvents";
 import { useCloseActionPrompt } from "@/composables/useCloseActionPrompt";
 import { useVisibilityChange } from "@/composables/useVisibilityChange";
+import { useWebDavAutoUpload } from "@/composables/useWebDavAutoUpload";
 import "@/i18n";
 import { translateBackendError } from "@/i18n/backend-errors";
 import * as api from "@/lib/api";
@@ -57,9 +58,12 @@ import {
   isResetZoomShortcut,
   isRefreshDataShortcut,
   isSaveShortcut,
+  isSwitchToNextTabShortcut,
+  isSwitchToPreviousTabShortcut,
   isToggleSidebarShortcut,
   isZoomInShortcut,
   isZoomOutShortcut,
+  switchToTabIndexFromShortcut,
 } from "@/lib/keyboardShortcuts";
 import { isPreviewTab } from "@/lib/tabPresentation";
 import { supportsSqlFileExecution } from "@/lib/databaseCapabilities";
@@ -67,6 +71,7 @@ import { classifyAiSqlExecution } from "@/lib/aiSqlExecutionPolicy";
 import { buildHistoryAiAnalysisPrompt } from "@/lib/historyAiAnalysis";
 import { countAvailableAgentDriverUpdates, type AgentDriverUpdateBadgeState } from "@/lib/agentDriverUpdateBadge";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/safeStorage";
+import { apiUrl, webPath } from "@/lib/webPath";
 import { rankSavedSqlHistory } from "@/lib/savedSqlHistory";
 import { isSchemaAware, isSingleDatabase, usesTreeSchemaMode } from "@/lib/databaseFeatureSupport";
 import { codeMirrorSqlDialect, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection } from "@/lib/jdbcDialect";
@@ -114,7 +119,9 @@ const showSettingsDialog = ref(false);
 const settingsInitialTab = ref("editor");
 const settingsInitialSection = ref<string | undefined>(undefined);
 const showQueryEditorDdlDialog = ref(false);
-const showDriverStore = ref(false);
+const driverStoreTabOpen = ref(false);
+const driverStoreActive = ref(false);
+const showDriverStore = computed(() => driverStoreTabOpen.value && driverStoreActive.value);
 const showQuickOpen = ref(false);
 const agentDriverUpdateCount = ref(0);
 const showHistory = ref(false);
@@ -203,14 +210,25 @@ async function resolveActiveExecutableSql(snapshot?: SqlExecutionSnapshot) {
 }
 
 const blockDangerousRedisCommands = ref(true);
+const databaseRequiredSignal = ref(0);
+const databaseRequiredTabId = ref<string | null>(null);
 
-const { dangerSql, pendingDangerSql, showDangerDialog, suppressDangerConfirm, tryExecute, doExecute, cancelActiveExecution, tryExplain, onDangerConfirm, explainMode } = useSqlExecution({
+function promptActiveDatabaseSelection() {
+  const tab = activeTab.value;
+  if (!tab) return;
+  databaseRequiredTabId.value = tab.id;
+  databaseRequiredSignal.value += 1;
+  toast(t("editor.selectDatabaseRequired"), 2500);
+}
+
+const { dangerSql, pendingDangerSql, showDangerDialog, suppressDangerConfirm, tryExecute, doExecute, cancelActiveExecution, tryExplain, onDangerConfirm, showSqlParameterDialog, sqlParameterSourceSql, sqlParameterNames, onSqlParametersConfirm, explainMode } = useSqlExecution({
   activeTab,
   activeConnection,
   executableSql,
   resolveExecutableSql: resolveActiveExecutableSql,
   activeOutputView,
   blockDangerousRedisCommands,
+  onMissingDatabase: promptActiveDatabaseSelection,
 });
 
 function requestActiveEditorExecute() {
@@ -230,6 +248,7 @@ const { setupTauriListeners, cleanupTauriListeners } = useTauriEvents({
 });
 const { showCloseActionPrompt, chooseQuit, chooseMinimize, setupCloseActionPromptListener, cleanupCloseActionPromptListener } = useCloseActionPrompt();
 useVisibilityChange();
+useWebDavAutoUpload();
 
 const appVersion = ref("");
 const isClassicLayout = computed(() => settingsStore.editorSettings.appLayout === "classic");
@@ -347,7 +366,7 @@ watch(
       );
     }
     if (id) newQueryContextSource.value = "tab";
-    if (id && showDriverStore.value) showDriverStore.value = false;
+    if (id && driverStoreActive.value) driverStoreActive.value = false;
     selectedSql.value = "";
     activeOutputView.value = "result";
     if (id) queryStore.reloadEvictedTab(id);
@@ -852,8 +871,8 @@ async function openConnectionQuery(connectionId: string) {
   }
 }
 
-function openSavedSqlFromWelcome(fileId: string) {
-  const file = savedSqlStore.getFile(fileId);
+async function openSavedSqlFromWelcome(fileId: string) {
+  const file = await savedSqlStore.ensureFileContent(fileId);
   if (!file) return;
   queryStore.openSavedSql(file);
   connectionStore.activeConnectionId = file.connectionId;
@@ -936,7 +955,12 @@ async function changeActiveConnection(connectionId: string) {
 
 function changeActiveDatabase(database: string) {
   const tab = activeTab.value;
-  if (tab) queryStore.updateDatabase(tab.id, database);
+  if (tab) {
+    queryStore.updateDatabase(tab.id, database);
+    if (databaseRequiredTabId.value === tab.id && database) {
+      databaseRequiredTabId.value = null;
+    }
+  }
 }
 
 async function setActiveDatabaseAsDefault() {
@@ -1050,7 +1074,7 @@ async function handleQuickOpenSelect(item: any) {
         await connectionStore.loadMongoDatabases(item.connectionId);
       } else if (config?.db_type === "elasticsearch") {
         await connectionStore.loadElasticsearchIndices(item.connectionId);
-      } else if (config?.db_type === "qdrant" || config?.db_type === "milvus" || config?.db_type === "weaviate") {
+      } else if (config?.db_type === "qdrant" || config?.db_type === "milvus" || config?.db_type === "weaviate" || config?.db_type === "chromadb") {
         await connectionStore.loadVectorCollections(item.connectionId);
       } else if (config?.db_type === "mq") {
         await connectionStore.loadMqTenants(item.connectionId);
@@ -1075,7 +1099,7 @@ async function handleQuickOpenSelect(item: any) {
         await connectionStore.loadMongoDatabases(item.connectionId);
       } else if (config?.db_type === "elasticsearch") {
         await connectionStore.loadElasticsearchIndices(item.connectionId);
-      } else if (config?.db_type === "qdrant" || config?.db_type === "milvus" || config?.db_type === "weaviate") {
+      } else if (config?.db_type === "qdrant" || config?.db_type === "milvus" || config?.db_type === "weaviate" || config?.db_type === "chromadb") {
         await connectionStore.loadVectorCollections(item.connectionId);
       } else if (config?.db_type === "mq") {
         await connectionStore.loadMqTenants(item.connectionId);
@@ -1140,10 +1164,37 @@ async function handleQuickOpenSelect(item: any) {
   }
 }
 
+function dispatchBeforeTabSwitch(tabId: string) {
+  if (tabId === queryStore.activeTabId) return;
+  window.dispatchEvent(new CustomEvent("dbx:before-tab-switch", { detail: { tabId, fromTabId: queryStore.activeTabId } }));
+}
+
+function activateQueryTab(tabId: string): boolean {
+  if (!queryStore.tabs.some((tab) => tab.id === tabId)) return false;
+  dispatchBeforeTabSwitch(tabId);
+  queryStore.activeTabId = tabId;
+  driverStoreActive.value = false;
+  return true;
+}
+
+function activateTabByIndex(index: number): boolean {
+  const tab = queryStore.tabs[index];
+  return tab ? activateQueryTab(tab.id) : false;
+}
+
+function activateAdjacentTab(direction: -1 | 1): boolean {
+  const count = queryStore.tabs.length;
+  if (count < 2) return false;
+  const currentIndex = queryStore.tabs.findIndex((tab) => tab.id === queryStore.activeTabId);
+  const nextIndex = currentIndex < 0 ? (direction > 0 ? 0 : count - 1) : (currentIndex + direction + count) % count;
+  return activateTabByIndex(nextIndex);
+}
+
 function handleKeydown(e: KeyboardEvent) {
   if (e.defaultPrevented) return;
 
   const shortcuts = settingsStore.editorSettings.shortcuts;
+  const switchTabIndex = switchToTabIndexFromShortcut(e, shortcuts);
 
   if (isOpenSettingsShortcut(e, shortcuts)) {
     e.preventDefault();
@@ -1183,10 +1234,32 @@ function handleKeydown(e: KeyboardEvent) {
     setSidebarOpen(!sidebarOpen.value);
     return;
   }
+  if (switchTabIndex != null) {
+    if (activateTabByIndex(switchTabIndex)) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    return;
+  }
+  if (isSwitchToPreviousTabShortcut(e, shortcuts)) {
+    if (activateAdjacentTab(-1)) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    return;
+  }
+  if (isSwitchToNextTabShortcut(e, shortcuts)) {
+    if (activateAdjacentTab(1)) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    return;
+  }
   if (isCloseTabShortcut(e, shortcuts)) {
     e.preventDefault();
     if (showDriverStore.value) {
-      showDriverStore.value = false;
+      driverStoreTabOpen.value = false;
+      driverStoreActive.value = false;
     } else if (queryStore.activeTabId) {
       queryStore.closeTab(queryStore.activeTabId);
     }
@@ -1242,7 +1315,7 @@ function onLoginSuccess() {
   authenticated.value = true;
   setupRequired.value = false;
   needsAuth.value = true;
-  window.history.replaceState(null, "", "/");
+  window.history.replaceState(null, "", webPath("/"));
   initApp();
 }
 
@@ -1252,9 +1325,16 @@ function initApp() {
   settingsStore
     .initDesktopSettings()
     .catch(() => {})
-    .then(() => savedSqlStore.initFromStorage())
     .then(() => {
-      console.log(`[STARTUP]   savedSqlStore.initFromStorage: ${(performance.now() - t0).toFixed(0)}ms`);
+      void savedSqlStore
+        .initFromStorage()
+        .then(() => {
+          console.log(`[STARTUP]   savedSqlStore.initFromStorage: ${(performance.now() - t0).toFixed(0)}ms`);
+          void queryStore.hydrateSavedSqlTabs();
+        })
+        .catch((e: any) => {
+          toast(t("connection.loadFailed", { message: e?.message || String(e) }), 5000);
+        });
       return connectionStore.initFromDisk();
     })
     .then(() => {
@@ -1309,7 +1389,8 @@ function handleContextMenu(e: MouseEvent) {
 }
 
 function openDriverStoreFromEvent() {
-  showDriverStore.value = true;
+  driverStoreTabOpen.value = true;
+  driverStoreActive.value = true;
 }
 
 function runUpdateNotificationChecks() {
@@ -1357,7 +1438,7 @@ onMounted(async () => {
   );
   if (!isDesktop) {
     try {
-      const res = await fetch("/api/auth/check");
+      const res = await fetch(apiUrl("/api/auth/check"));
       const data = await res.json();
       needsAuth.value = data.required;
       authenticated.value = data.authenticated;
@@ -1366,7 +1447,7 @@ onMounted(async () => {
       /* server unreachable */
     }
     if (needsAuth.value && !authenticated.value) {
-      history.replaceState(null, "", "/login");
+      history.replaceState(null, "", webPath("/login"));
     }
     if (!setupRequired.value && (!needsAuth.value || authenticated.value)) initApp();
     api
@@ -1436,7 +1517,10 @@ onUnmounted(() => {
           @toggle-sql-library="toggleSqlLibrary"
           @open-github="openGitHub"
           @open-settings="openSettings()"
-          @open-driver-store="showDriverStore = !showDriverStore"
+          @open-driver-store="
+            driverStoreTabOpen = true;
+            driverStoreActive = true;
+          "
           @check-updates="checkUpdates()"
           @open-transfer="dialogs.showTransferDialog.value = true"
           @open-sql-file="dialogs.showSqlFileDialog.value = true"
@@ -1454,9 +1538,23 @@ onUnmounted(() => {
 
           <div :class="isClassicLayout ? 'flex-1 min-w-0 overflow-hidden' : 'flex-1 min-w-0 overflow-hidden rounded-md border border-border/80 bg-background'">
             <div class="h-full flex flex-col min-w-0">
-              <AppTabBar :show-driver-store="showDriverStore" :agent-driver-update-count="toolbarAgentDriverUpdateCount" @toggle-driver-store="showDriverStore = true" @close-driver-store="showDriverStore = false" @save-tab="handleSaveTab" />
-              <DriverStorePage v-if="showDriverStore" class="flex-1 min-h-0" :update-notifications-enabled="updateNotificationsEnabled" @update-count-change="updateAgentDriverUpdateCount" />
-              <div v-else-if="activeTab" class="flex flex-col flex-1 min-h-0">
+              <AppTabBar
+                :driver-store-open="driverStoreTabOpen"
+                :driver-store-active="driverStoreActive"
+                :agent-driver-update-count="toolbarAgentDriverUpdateCount"
+                @activate-driver-store="
+                  driverStoreTabOpen = true;
+                  driverStoreActive = true;
+                "
+                @activate-tab="driverStoreActive = false"
+                @close-driver-store="
+                  driverStoreTabOpen = false;
+                  driverStoreActive = false;
+                "
+                @save-tab="handleSaveTab"
+              />
+              <DriverStorePage v-if="driverStoreTabOpen" v-show="driverStoreActive" class="flex-1 min-h-0" :update-notifications-enabled="updateNotificationsEnabled" @update-count-change="updateAgentDriverUpdateCount" />
+              <div v-if="activeTab" v-show="!driverStoreActive" class="flex flex-col flex-1 min-h-0">
                 <EditorToolbar
                   v-if="activeTab.mode === 'query' && !isPreviewTab(activeTab)"
                   :active-tab="activeTab"
@@ -1465,6 +1563,7 @@ onUnmounted(() => {
                   :explain-mode="explainMode"
                   :block-dangerous-redis-commands="blockDangerousRedisCommands"
                   :sql-keyword-case="settingsStore.editorSettings.sqlFormatter.keywordCase"
+                  :database-required-signal="databaseRequiredTabId === activeTab.id ? databaseRequiredSignal : 0"
                   @update:explain-mode="(m: 'explain' | 'autotrace') => (explainMode = m)"
                   @update:block-dangerous-redis-commands="(v: boolean) => (blockDangerousRedisCommands = v)"
                   @execute="requestActiveEditorExecute()"
@@ -1543,7 +1642,7 @@ onUnmounted(() => {
                 </KeepAlive>
               </div>
               <WelcomeScreen
-                v-else
+                v-else-if="!driverStoreActive"
                 :connection-stats="connectionStats"
                 :recent-connections="recentConnections"
                 :saved-sql-history-items="savedSqlHistoryItems"
@@ -1591,11 +1690,16 @@ onUnmounted(() => {
           :show-danger-dialog="showDangerDialog"
           :danger-sql="dangerSql"
           :suppress-danger-confirm="suppressDangerConfirm"
+          :show-sql-parameter-dialog="showSqlParameterDialog"
+          :sql-parameter-source-sql="sqlParameterSourceSql"
+          :sql-parameter-names="sqlParameterNames"
           @update:show-connection-dialog="setConnectionDialogOpen"
           @update:show-settings-dialog="showSettingsDialog = $event"
           @update:show-danger-dialog="showDangerDialog = $event"
           @update:suppress-danger-confirm="suppressDangerConfirm = $event"
+          @update:show-sql-parameter-dialog="showSqlParameterDialog = $event"
           @danger-confirm="onDangerConfirm"
+          @sql-parameters-confirm="onSqlParametersConfirm"
           @connect-started="(name: string) => toast(t('connection.connecting', { name }), 30000)"
           @connect-succeeded="(name: string) => toast(t('connection.connectSuccess', { name }), 2000)"
           @connect-failed="
@@ -1609,7 +1713,8 @@ onUnmounted(() => {
           "
           @open-driver-store="
             setConnectionDialogOpen(false);
-            showDriverStore = true;
+            driverStoreTabOpen = true;
+            driverStoreActive = true;
           "
           @open-lineage-target="openLineageTarget"
           @open-database-search-target="openDatabaseSearchTarget"

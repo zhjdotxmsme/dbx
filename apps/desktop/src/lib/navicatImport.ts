@@ -54,6 +54,10 @@ function getAny(values: Record<string, string>, keys: string[]) {
   return "";
 }
 
+function getSqlitePath(values: Record<string, string>) {
+  return getAny(values, ["databaseFile", "databaseFileName", "databaseFilename", "filename", "fileName", "path", "databasePath", "dbPath", "dbFile", "sqliteFile", "sqlitePath", "database", "databaseName"]);
+}
+
 function truthyNavicatFlag(value: string) {
   const normalized = value.trim().toLowerCase();
   return ["1", "true", "yes", "y", "on", "checked"].includes(normalized);
@@ -145,7 +149,7 @@ function isConnectionCandidate(node: ParsedNode) {
   const type = getAny(node.values, ["type", "connType", "connectionType", "databaseType", "driver"]);
   const name = getAny(node.values, ["name", "connectionName", "connName", "caption", "title"]);
   const host = getAny(node.values, ["host", "server", "hostname", "serverHost", "address"]);
-  const file = getAny(node.values, ["databaseFile", "filename", "path", "databasePath"]);
+  const file = getSqlitePath(node.values);
   return !!(name || host || file) && !!(type || host || file);
 }
 
@@ -160,23 +164,28 @@ async function parseConnection(node: ParsedNode): Promise<ConnectionConfig | nul
     return null;
   }
 
-  // Navicat NCX uses ServiceProvider to distinguish vendor-specific database types.
-  // e.g. OceanBase Oracle reports ConnType="ORACLE" ServiceProvider="AliyunOceanBase"
+  // Navicat NCX uses ServiceProvider to distinguish vendor-specific database providers.
+  // e.g. OceanBase MySQL reports ConnType="MYSQL" ServiceProvider="AliyunOceanBase"
+  //      OceanBase Oracle reports ConnType="ORACLE" ServiceProvider="AliyunOceanBase"
   //      GaussDB reports ConnType="POSTGRESQL" ServiceProvider="HuaweiCloudGaussDB"
+  // For OceanBase, ConnType remains the source of truth for the compatibility mode.
   const serviceProvider = getAny(node.values, ["serviceprovider"]);
   let effectiveProfile = profile;
   if (serviceProvider) {
     const sp = serviceProvider.toLowerCase();
     if (sp.includes("oceanbase")) {
-      effectiveProfile = { ...profile, dbType: "oceanbase-oracle", profile: "oceanbase", label: "OceanBase", port: 2881 };
+      const oceanbaseOracleMode = normalizeKey(rawType).includes("oracle") || profile.dbType === "oracle";
+      effectiveProfile = oceanbaseOracleMode ? { ...profile, dbType: "oceanbase-oracle", profile: "oceanbase-oracle", label: "OceanBase Oracle Mode", port: 2881 } : { ...profile, dbType: "mysql", profile: "oceanbase", label: "OceanBase", port: 2881 };
     } else if (sp.includes("gaussdb") || sp.includes("huaweicloudgauss")) {
       effectiveProfile = { ...profile, dbType: "gaussdb", profile: "gaussdb", label: "GaussDB", port: 8000 };
     }
   }
 
-  const name = getAny(node.values, ["name", "connectionName", "connName", "caption", "title"]) || getAny(node.values, ["host", "server", "hostname"]) || effectiveProfile.label;
-  const host = getAny(node.values, ["host", "server", "hostname", "serverHost", "address"]) || getAny(node.values, ["databaseFile", "filename", "path", "databasePath"]) || (effectiveProfile.dbType === "sqlite" ? "" : "127.0.0.1");
-  const database = getAny(node.values, ["database", "databaseName", "initialDatabase", "serviceName", "sid", "schema"]);
+  const sqlitePath = effectiveProfile.dbType === "sqlite" ? getSqlitePath(node.values) : "";
+  const name = getAny(node.values, ["name", "connectionName", "connName", "caption", "title"]) || getAny(node.values, ["host", "server", "hostname"]) || sqlitePath || effectiveProfile.label;
+  const host = sqlitePath || getAny(node.values, ["host", "server", "hostname", "serverHost", "address"]) || (effectiveProfile.dbType === "sqlite" ? "" : "127.0.0.1");
+  // Navicat exports OceanBase Oracle connections with Database="ORCL", but OceanBase resolves the target from the username.
+  const database = effectiveProfile.dbType === "sqlite" ? sqlitePath : effectiveProfile.dbType === "oceanbase-oracle" ? "" : getAny(node.values, ["database", "databaseName", "initialDatabase", "serviceName", "sid", "schema"]);
   const isOracleLike = effectiveProfile.dbType === "oracle" || effectiveProfile.dbType === "oceanbase-oracle";
   const oracleConnectionType = isOracleLike && getAny(node.values, ["sid"]) ? "sid" : isOracleLike ? "service_name" : undefined;
   const username = getAny(node.values, ["user", "username", "userName", "uid"]) || profile.user;

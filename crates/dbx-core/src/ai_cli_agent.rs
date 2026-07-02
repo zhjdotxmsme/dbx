@@ -2,10 +2,14 @@ use crate::agent_events::AgentEvent;
 use crate::ai::{AiMessage, AiModelInfo};
 use crate::token_usage::TokenUsage;
 use serde_json::Value;
+use std::ffi::OsStr;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Notify;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Debug, Clone)]
 pub struct CliAgentRunOptions {
@@ -29,6 +33,8 @@ pub enum CliAgentJsonlDialect {
 
 pub struct CliAgentProcessSpec {
     pub command: CliAgentCommandSpec,
+    pub env: Vec<(String, String)>,
+    pub stdin: Option<String>,
     pub dialect: CliAgentJsonlDialect,
     pub classify_spawn_error: fn(&str) -> String,
     pub classify_run_error: fn(&str) -> String,
@@ -47,6 +53,7 @@ pub fn dbx_mcp_enabled_tools(agent_mode: bool) -> Vec<&'static str> {
     let mut tools = vec!["dbx_list_connections", "dbx_list_tables", "dbx_describe_table", "dbx_get_schema_context"];
     if agent_mode {
         tools.push("dbx_execute_query");
+        tools.push("dbx_execute_redis_command");
     }
     tools
 }
@@ -95,12 +102,28 @@ pub fn model_infos(ids: &[&str]) -> Vec<AiModelInfo> {
     ids.iter().map(|id| AiModelInfo { id: (*id).to_string(), display_name: None }).collect()
 }
 
+pub fn cli_command(program: impl AsRef<OsStr>) -> Command {
+    let command = Command::new(program);
+    configure_cli_command(command)
+}
+
+#[cfg(windows)]
+fn configure_cli_command(mut command: Command) -> Command {
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
+#[cfg(not(windows))]
+fn configure_cli_command(command: Command) -> Command {
+    command
+}
+
 pub async fn list_json_models_or_default(
     program: String,
     args: impl IntoIterator<Item = String>,
     default_models: &[&str],
 ) -> Result<Vec<AiModelInfo>, String> {
-    let output = Command::new(program).args(args).output().await;
+    let output = cli_command(program).args(args).output().await;
 
     let Ok(output) = output else {
         return Ok(model_infos(default_models));
@@ -284,6 +307,7 @@ fn cli_item_id(item: &Value) -> String {
 fn cli_tool_name(item: &Value) -> String {
     item.get("tool_name")
         .and_then(Value::as_str)
+        .or_else(|| item.get("tool").and_then(Value::as_str))
         .or_else(|| item.get("name").and_then(Value::as_str))
         .or_else(|| item.get("server_tool_name").and_then(Value::as_str))
         .unwrap_or("cli_tool")
@@ -299,7 +323,16 @@ fn cli_tool_args(item: &Value) -> Value {
 }
 
 fn cli_tool_result(item: &Value) -> Value {
-    item.get("result").or_else(|| item.get("output")).or_else(|| item.get("content")).cloned().unwrap_or(Value::Null)
+    non_null_field(item, "result")
+        .or_else(|| non_null_field(item, "output"))
+        .or_else(|| non_null_field(item, "content"))
+        .or_else(|| non_null_field(item, "error"))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn non_null_field<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+    value.get(key).filter(|field| !field.is_null())
 }
 
 fn cli_text(item: &Value) -> Option<String> {
@@ -325,12 +358,21 @@ pub async fn run_cli_jsonl_agent(
     cancelled: &Notify,
     on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
 ) -> Result<String, String> {
-    let mut child = Command::new(&spec.command.program)
+    let mut command = cli_command(&spec.command.program);
+    let mut child = command
         .args(&spec.command.args)
+        .envs(spec.env.iter().map(|(key, value)| (key.as_str(), value.as_str())))
+        .stdin(if spec.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| (spec.classify_spawn_error)(&e.to_string()))?;
+
+    if let Some(input) = spec.stdin {
+        let mut stdin = child.stdin.take().ok_or_else(|| "CLI agent stdin not available".to_string())?;
+        stdin.write_all(input.as_bytes()).await.map_err(|e| format!("Failed to write CLI agent stdin: {e}"))?;
+        stdin.shutdown().await.map_err(|e| format!("Failed to close CLI agent stdin: {e}"))?;
+    }
 
     let stdout = child.stdout.take().ok_or_else(|| "Failed to capture CLI agent stdout".to_string())?;
     let stderr = child.stderr.take().ok_or_else(|| "Failed to capture CLI agent stderr".to_string())?;
@@ -426,6 +468,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn jsonl_agent_applies_env_to_child() {
+        let spec = CliAgentProcessSpec {
+            command: CliAgentCommandSpec {
+                program: "sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "printf '%s\n' \"{\\\"type\\\":\\\"item.completed\\\",\\\"item\\\":{\\\"type\\\":\\\"agent_message\\\",\\\"text\\\":\\\"$DBX_TEST_ENV\\\"}}\" \"{\\\"type\\\":\\\"turn.completed\\\"}\"".to_string(),
+                ],
+            },
+            env: vec![("DBX_TEST_ENV".to_string(), "from-env".to_string())],
+            stdin: None,
+            dialect: CliAgentJsonlDialect::CodexExec,
+            classify_spawn_error,
+            classify_run_error,
+        };
+
+        let result = run_cli_jsonl_agent(spec, &Notify::new(), |_| {}).await.unwrap();
+
+        assert_eq!(result, "from-env");
+    }
+
+    #[tokio::test]
+    async fn jsonl_agent_writes_stdin_to_child() {
+        let spec = CliAgentProcessSpec {
+            command: CliAgentCommandSpec {
+                program: "sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "input=$(cat); printf '%s\n' \"{\\\"type\\\":\\\"item.completed\\\",\\\"item\\\":{\\\"type\\\":\\\"agent_message\\\",\\\"text\\\":\\\"$input\\\"}}\" \"{\\\"type\\\":\\\"turn.completed\\\"}\"".to_string(),
+                ],
+            },
+            env: Vec::new(),
+            stdin: Some("prompt from stdin".to_string()),
+            dialect: CliAgentJsonlDialect::CodexExec,
+            classify_spawn_error,
+            classify_run_error,
+        };
+
+        let result = run_cli_jsonl_agent(spec, &Notify::new(), |_| {}).await.unwrap();
+
+        assert_eq!(result, "prompt from stdin");
+    }
+
+    #[tokio::test]
     async fn jsonl_error_kills_and_waits_for_child() {
         let pid_file = std::env::temp_dir().join(format!(
             "dbx-cli-agent-error-{}-{}",
@@ -439,6 +525,8 @@ mod tests {
 
         let spec = CliAgentProcessSpec {
             command: CliAgentCommandSpec { program: "sh".to_string(), args: vec!["-c".to_string(), script] },
+            env: Vec::new(),
+            stdin: None,
             dialect: CliAgentJsonlDialect::CodexExec,
             classify_spawn_error,
             classify_run_error,

@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { AlertTriangle, Check, ChevronDown, ChevronUp, Copy, Database, Info, KeyRound, Loader2, Maximize2, Plus, RefreshCw, Save, Settings, SlidersHorizontal, Trash2, X } from "@lucide/vue";
+import { AlertTriangle, Check, ChevronDown, Copy, Database, Info, KeyRound, ListChevronsUpDown, Loader2, Maximize2, Plus, RefreshCw, Save, Settings, SlidersHorizontal, Trash2, X } from "@lucide/vue";
 import { DropdownMenu, DropdownMenuCheckboxItem, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -20,12 +20,14 @@ import { useTheme } from "@/composables/useTheme";
 import { useToast } from "@/composables/useToast";
 import { type SqlHighlighter, createShikiSqlHighlighter } from "@/lib/sqlHighlighter";
 import { copyToClipboard } from "@/lib/clipboard";
+import { formatSqlForDisplay, sqlFormatDialectForDbType } from "@/lib/sqlFormatter";
 import { queryTimeoutSecsForConnection } from "@/lib/queryTimeout";
 import { type EditableStructureColumn, type EditableStructureForeignKey, type EditableStructureIndex, type EditableStructureTrigger } from "@/lib/tableStructureEditorSql";
 import { PRESET_FIELDS_TEMPLATE_ID, createTableColumnTemplateDrafts } from "@/lib/tableColumnTemplates";
 import { getTableMetadataCapabilities } from "@/lib/tableMetadataCapabilities";
 import { canAddTableStructureColumn, getTableStructureCapabilities } from "@/lib/tableStructureCapabilities";
 import { connectionObjectTreeQuerySchema, tableStructureDatabaseTypeForConnection } from "@/lib/jdbcDialect";
+import type { TableStructureEditorDraft } from "@/types/database";
 import {
   buildStructureTargetLabel,
   combineDataTypeForDatabase,
@@ -33,6 +35,7 @@ import {
   createForeignKeyDrafts,
   createIndexDrafts,
   createTriggerDrafts,
+  dataTypeLengthInputValue,
   generateIndexName,
   generateUniqueIndexName,
   getColumnEditorControls,
@@ -56,6 +59,7 @@ const historyStore = useHistoryStore();
 const settingsStore = useSettingsStore();
 const { toast } = useToast();
 const rootRef = ref<HTMLElement>();
+const dynamicDataTypeOptionsCache = new Map<string, string[]>();
 
 const sqlHighlighter = ref<SqlHighlighter>();
 onMounted(async () => {
@@ -76,9 +80,11 @@ const props = defineProps<{
   database: string;
   schema?: string;
   tableName: string;
+  draft?: TableStructureEditorDraft;
 }>();
 
 const emit = defineEmits<{
+  "update:draft": [draft: TableStructureEditorDraft | undefined];
   saved: [commentChanged: boolean];
   close: [];
   openSettings: [initialTab?: string, initialSection?: string];
@@ -100,7 +106,8 @@ async function fetchDdl() {
   if (!props.connectionId || !props.database || !props.tableName || ddlFetched.value || !tableMetadataCapabilities.value.ddl) return;
   ddlLoading.value = true;
   try {
-    ddlContent.value = await api.getTableDdl(props.connectionId, props.database, metadataSchema.value, props.tableName);
+    const ddl = await api.getTableDdl(props.connectionId, props.database, metadataSchema.value, props.tableName);
+    ddlContent.value = await formatSqlForDisplay(ddl, sqlFormatDialectForDbType(databaseType.value), settingsStore.editorSettings.sqlFormatter);
     ddlFetched.value = true;
   } catch (e: any) {
     ddlContent.value = `-- Error: ${e?.message || e}`;
@@ -310,7 +317,7 @@ const structureDensityStyle = computed(() => {
     "--structure-line-height": String(metric.lineHeight),
   };
 });
-const structureControlClass = "h-[var(--structure-control-height)] min-w-0 px-[var(--structure-control-px)] py-0 text-[length:var(--structure-font-size)]";
+const structureControlClass = "h-[var(--structure-control-height)] min-w-0 rounded-[6px] px-[var(--structure-control-px)] py-0 text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25";
 const structureMonoControlClass = `${structureControlClass} font-mono`;
 const structureToolbarButtonClass = "h-[var(--structure-control-height)] gap-1 px-[var(--structure-control-px)] text-[length:var(--structure-font-size)]";
 const structureIconButtonClass = "h-[var(--structure-control-height)] w-[var(--structure-control-height)]";
@@ -411,6 +418,7 @@ watch(
 watch(localStructureDensity, (density, previousDensity) => {
   if (density === previousDensity) return;
   applyStructureDensityWidths(density);
+  persistStructureDensity(density);
 });
 
 function onColResize(e: MouseEvent, col: number) {
@@ -454,7 +462,8 @@ const structureCapabilities = computed(() => getTableStructureCapabilities(datab
 const tableMetadataCapabilities = computed(() => getTableMetadataCapabilities(databaseType.value));
 const structureDialect = computed(() => structureCapabilities.value.dialect);
 const isTableCommentDisabled = computed(() => !structureCapabilities.value.comment);
-const dataTypeOptions = computed(() => getDataTypeOptions(databaseType.value));
+const dynamicDataTypeOptions = ref<string[]>([]);
+const dataTypeOptions = computed(() => mergeDataTypeOptions(dynamicDataTypeOptions.value, getDataTypeOptions(databaseType.value)));
 const columnEditorControls = computed(() => getColumnEditorControls(databaseType.value));
 
 const indexTypesByDb: Record<string, string[]> = {
@@ -587,10 +596,59 @@ function isManticoreJsonColumn(column: EditableStructureColumn): boolean {
 
 let sqlPreviewRequestId = 0;
 let structureLoadRequestId = 0;
+let dataTypeOptionsRequestId = 0;
 let sqlPreviewDebounceTimer: ReturnType<typeof setTimeout> | undefined;
 let deferredSqlPreviewRefresh = false;
 let keydownListenerRegistered = false;
 let skipNextRefreshVersion = false;
+let restoringDraft = false;
+let syncingDraft = false;
+let draftHydrated = false;
+
+function cloneDraftValue<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function createCurrentDraft(initialized = true): TableStructureEditorDraft {
+  return {
+    activeTab: activeTab.value as TableStructureEditorDraft["activeTab"],
+    newTableName: newTableName.value,
+    tableComment: tableComment.value,
+    originalTableComment: originalTableComment.value,
+    columns: cloneDraftValue(columns.value),
+    indexes: cloneDraftValue(indexes.value),
+    foreignKeys: cloneDraftValue(foreignKeys.value),
+    triggers: cloneDraftValue(triggers.value),
+    initialized,
+  };
+}
+
+function syncDraftToParent() {
+  if (!draftHydrated) return;
+  if (restoringDraft || syncingDraft) return;
+  syncingDraft = true;
+  emit("update:draft", createCurrentDraft());
+  syncingDraft = false;
+}
+
+function restoreDraft(draft: TableStructureEditorDraft) {
+  restoringDraft = true;
+  activeTab.value = draft.activeTab || "columns";
+  newTableName.value = draft.newTableName || "";
+  tableComment.value = draft.tableComment || "";
+  originalTableComment.value = draft.originalTableComment || "";
+  columns.value = cloneDraftValue(draft.columns || []);
+  indexes.value = cloneDraftValue(draft.indexes || []);
+  foreignKeys.value = cloneDraftValue(draft.foreignKeys || []);
+  triggers.value = cloneDraftValue(draft.triggers || []);
+  restoringDraft = false;
+  draftHydrated = true;
+}
+
+function markDraftHydratedAndSync() {
+  draftHydrated = true;
+  syncDraftToParent();
+}
 
 function hasPendingStructureChanges(): boolean {
   if (isCreateMode.value) {
@@ -610,6 +668,57 @@ function clearSqlPreviewState() {
   sqlPreviewLoading.value = false;
   pendingStatements.value = [];
   warnings.value = [];
+}
+
+function dataTypeOptionsCacheKey(connectionId: string, database: string) {
+  return `${connectionId}\u0000${database}`;
+}
+
+function mergeDataTypeOptions(primary: readonly string[], fallback: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const option of [...primary, ...fallback]) {
+    const trimmed = option.trim();
+    if (!trimmed) continue;
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(trimmed);
+  }
+  return result;
+}
+
+async function loadDynamicDataTypeOptions() {
+  const requestId = ++dataTypeOptionsRequestId;
+  const connectionId = props.connectionId;
+  const database = props.database;
+  if (!connectionId || !database) {
+    dynamicDataTypeOptions.value = [];
+    return;
+  }
+  const cacheKey = dataTypeOptionsCacheKey(connectionId, database);
+  const cached = dynamicDataTypeOptionsCache.get(cacheKey);
+  if (cached) {
+    dynamicDataTypeOptions.value = cached;
+    return;
+  }
+  dynamicDataTypeOptions.value = [];
+  try {
+    await store.ensureConnected(connectionId);
+    const options = await api.listDataTypes(connectionId, database);
+    if (requestId !== dataTypeOptionsRequestId) return;
+    const normalized = mergeDataTypeOptions(options, []);
+    if (normalized.length > 0) {
+      dynamicDataTypeOptionsCache.set(cacheKey, normalized);
+      dynamicDataTypeOptions.value = normalized;
+    } else {
+      dynamicDataTypeOptions.value = [];
+    }
+  } catch {
+    if (requestId === dataTypeOptionsRequestId) {
+      dynamicDataTypeOptions.value = [];
+    }
+  }
 }
 
 function scheduleSqlPreviewRefresh() {
@@ -672,6 +781,11 @@ const canApply = computed(
   () => !loading.value && !saving.value && !postSaveRefreshing.value && !secondaryMetadataLoading.value && !sqlPreviewLoading.value && pendingStatements.value.length > 0 && warnings.value.length === 0 && !!props.connectionId && (isCreateMode.value ? !!newTableName.value.trim() : !!props.tableName),
 );
 
+function clearDraft() {
+  draftHydrated = false;
+  emit("update:draft", undefined);
+}
+
 function resetState() {
   activeTab.value = "columns";
   loading.value = false;
@@ -695,6 +809,12 @@ function resetState() {
   originalTableComment.value = "";
 }
 
+async function reloadStructureFromDatabase() {
+  if (isCreateMode.value) return;
+  draftHydrated = false;
+  await loadStructure(false, FULL_STRUCTURE_REFRESH_SCOPE, true, { blockSecondaryMetadata: true });
+}
+
 function setSecondaryMetadataLoading(scope: StructureRefreshScope, value: boolean) {
   if (scope.indexes && tableMetadataCapabilities.value.indexes) indexesLoading.value = value;
   if (scope.foreignKeys && tableMetadataCapabilities.value.foreignKeys) foreignKeysLoading.value = value;
@@ -715,7 +835,7 @@ async function fetchTableCommentValue(connectionId: string, database: string, sc
   }
 }
 
-async function loadStructure(silent = false, scope: StructureRefreshScope = FULL_STRUCTURE_REFRESH_SCOPE, showErrors = true, options: { blockSecondaryMetadata?: boolean } = {}) {
+async function loadStructure(silent = false, scope: StructureRefreshScope = FULL_STRUCTURE_REFRESH_SCOPE, showErrors = true, options: { blockSecondaryMetadata?: boolean; preserveDraft?: boolean } = {}) {
   const connectionId = props.connectionId;
   const database = props.database;
   const schema = metadataSchema.value;
@@ -726,6 +846,7 @@ async function loadStructure(silent = false, scope: StructureRefreshScope = FULL
   setSecondaryMetadataLoading(scope, true);
   errorMessage.value = "";
   let secondaryMetadataScheduled = false;
+  let loadedSuccessfully = false;
   try {
     await store.ensureConnected(connectionId);
 
@@ -740,7 +861,7 @@ async function loadStructure(silent = false, scope: StructureRefreshScope = FULL
       if (databaseType.value === "manticoresearch" && tableMetadataCapabilities.value.ddl) {
         try {
           const ddl = await api.getTableDdl(connectionId, database, schema, tableName);
-          ddlContent.value = ddl;
+          ddlContent.value = await formatSqlForDisplay(ddl, sqlFormatDialectForDbType(databaseType.value), settingsStore.editorSettings.sqlFormatter);
           ddlFetched.value = true;
           nextColumns = applyManticoreDdlColumnExtras(nextColumns, ddl);
         } catch {
@@ -774,6 +895,7 @@ async function loadStructure(silent = false, scope: StructureRefreshScope = FULL
     if (options.blockSecondaryMetadata) {
       await secondaryMetadataPromise;
     }
+    loadedSuccessfully = true;
   } catch (e: any) {
     if (showErrors) {
       errorMessage.value = e?.message || String(e);
@@ -785,6 +907,9 @@ async function loadStructure(silent = false, scope: StructureRefreshScope = FULL
       setSecondaryMetadataLoading(scope, false);
     }
     if (!silent) loading.value = false;
+    if (!options.preserveDraft && loadedSuccessfully && requestId === structureLoadRequestId) {
+      markDraftHydratedAndSync();
+    }
   }
 }
 
@@ -842,28 +967,183 @@ function removeNewColumn(column: EditableStructureColumn) {
   columns.value = columns.value.filter((item) => item.id !== column.id);
 }
 
-function canMoveColumn(index: number, direction: -1 | 1): boolean {
+type ColumnDragState = {
+  columnId: string;
+  sourceIndex: number;
+  insertionIndex: number | null;
+};
+
+const columnDragState = ref<ColumnDragState | null>(null);
+let columnDragPreviousBodyUserSelect = "";
+let columnDragPreviousBodyCursor = "";
+let columnDragTracking = false;
+
+function canDragColumn(index: number): boolean {
   if (loading.value || saving.value) return false;
-  if (!Number.isInteger(index) || (direction !== -1 && direction !== 1)) return false;
-  const targetIndex = index + direction;
-  if (targetIndex < 0 || targetIndex >= columns.value.length) return false;
-  if (columns.value[index]?.markedForDrop || columns.value[targetIndex]?.markedForDrop) return false;
-  // Draft columns can always swap order among themselves —
-  // ADD COLUMN statement order determines their final physical placement.
-  if (!columns.value[index]?.original && !columns.value[targetIndex]?.original) return true;
-  return canShowColumnMoveControls.value;
+  if (!Number.isInteger(index) || index < 0 || index >= columns.value.length) return false;
+  const column = columns.value[index];
+  if (!column || column.markedForDrop) return false;
+  if (!column.original) return true;
+  return canShowColumnDragControls.value;
 }
 
-const canShowColumnMoveControls = computed(() => isCreateMode.value || structureCapabilities.value.reorderColumn);
+function canDropColumnAt(sourceIndex: number, insertionIndex: number): boolean {
+  if (!canDragColumn(sourceIndex)) return false;
+  if (!Number.isInteger(insertionIndex) || insertionIndex < 0 || insertionIndex > columns.value.length) return false;
+  if (insertionIndex === sourceIndex || insertionIndex === sourceIndex + 1) return false;
+  const sourceColumn = columns.value[sourceIndex];
+  if (!sourceColumn) return false;
+  const crossedColumns = insertionIndex < sourceIndex ? columns.value.slice(insertionIndex, sourceIndex) : columns.value.slice(sourceIndex + 1, insertionIndex);
+  if (crossedColumns.some((column) => column.markedForDrop)) return false;
+  if (canShowColumnDragControls.value) return true;
+  if (sourceColumn.original) return false;
+  return crossedColumns.every((column) => !column.original);
+}
 
-function moveColumn(index: number, direction: -1 | 1) {
-  if (!canMoveColumn(index, direction)) return;
-  const targetIndex = index + direction;
+const canShowColumnDragControls = computed(() => isCreateMode.value || structureCapabilities.value.reorderColumn);
+
+function moveColumnTo(index: number, insertionIndex: number) {
+  if (!canDropColumnAt(index, insertionIndex)) return;
   const nextColumns = [...columns.value];
   const [column] = nextColumns.splice(index, 1);
   if (!column) return;
-  nextColumns.splice(targetIndex, 0, column);
+  const adjustedInsertionIndex = insertionIndex > index ? insertionIndex - 1 : insertionIndex;
+  nextColumns.splice(adjustedInsertionIndex, 0, column);
   columns.value = nextColumns;
+}
+
+function onColumnDragPointerDown(index: number, event: PointerEvent) {
+  if (event.button !== 0 || !canDragColumn(index)) return;
+  const column = columns.value[index];
+  if (!column) return;
+  event.preventDefault();
+  event.stopPropagation();
+  columnDragState.value = {
+    columnId: column.id,
+    sourceIndex: index,
+    insertionIndex: null,
+  };
+  columnDragPreviousBodyUserSelect = document.body.style.userSelect;
+  columnDragPreviousBodyCursor = document.body.style.cursor;
+  columnDragTracking = true;
+  document.body.style.userSelect = "none";
+  document.body.style.cursor = "grabbing";
+  updateColumnDragInsertion(event.clientY);
+  window.addEventListener("pointermove", onColumnDragPointerMove, true);
+  window.addEventListener("pointerup", onColumnDragPointerUp, true);
+  window.addEventListener("pointercancel", onColumnDragPointerCancel, true);
+}
+
+function onColumnDragPointerMove(event: PointerEvent) {
+  if (!columnDragState.value) return;
+  event.preventDefault();
+  updateColumnDragInsertion(event.clientY);
+}
+
+function onColumnDragPointerUp(event: PointerEvent) {
+  event.preventDefault();
+  const state = columnDragState.value;
+  stopColumnDragTracking();
+  if (state && state.insertionIndex !== null && canDropColumnAt(state.sourceIndex, state.insertionIndex)) {
+    moveColumnTo(state.sourceIndex, state.insertionIndex);
+  }
+  columnDragState.value = null;
+}
+
+function onColumnDragPointerCancel() {
+  stopColumnDragTracking();
+  columnDragState.value = null;
+}
+
+function stopColumnDragTracking() {
+  if (!columnDragTracking) return;
+  columnDragTracking = false;
+  window.removeEventListener("pointermove", onColumnDragPointerMove, true);
+  window.removeEventListener("pointerup", onColumnDragPointerUp, true);
+  window.removeEventListener("pointercancel", onColumnDragPointerCancel, true);
+  document.body.style.userSelect = columnDragPreviousBodyUserSelect;
+  document.body.style.cursor = columnDragPreviousBodyCursor;
+}
+
+function updateColumnDragInsertion(clientY: number) {
+  const state = columnDragState.value;
+  if (!state) return;
+  const insertionIndex = columnDragInsertionIndexFromPoint(clientY);
+  state.insertionIndex = insertionIndex !== null && canDropColumnAt(state.sourceIndex, insertionIndex) ? insertionIndex : null;
+}
+
+function columnDragInsertionIndexFromPoint(clientY: number): number | null {
+  const rows = Array.from(rootRef.value?.querySelectorAll<HTMLElement>("[data-column-row-index]") ?? []);
+  if (!rows.length) return null;
+  const firstRect = rows[0].getBoundingClientRect();
+  if (clientY < firstRect.top) return 0;
+  for (const row of rows) {
+    const rowIndex = Number(row.dataset.columnRowIndex);
+    if (!Number.isInteger(rowIndex)) continue;
+    const rect = row.getBoundingClientRect();
+    if (clientY <= rect.bottom) {
+      return clientY > rect.top + rect.height / 2 ? rowIndex + 1 : rowIndex;
+    }
+  }
+  return rows.length;
+}
+
+function onColumnDragStart(index: number, event: DragEvent) {
+  if (!canDragColumn(index)) {
+    event.preventDefault();
+    return;
+  }
+  const column = columns.value[index];
+  if (!column) return;
+  columnDragState.value = {
+    columnId: column.id,
+    sourceIndex: index,
+    insertionIndex: null,
+  };
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", column.name || column.id);
+  }
+}
+
+function onColumnDragOver(index: number, event: DragEvent) {
+  const state = columnDragState.value;
+  if (!state || columns.value[index]?.markedForDrop) return;
+  const insertionIndex = columnDragInsertionIndex(index, event);
+  if (!canDropColumnAt(state.sourceIndex, insertionIndex)) return;
+  event.preventDefault();
+  state.insertionIndex = insertionIndex;
+  if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+}
+
+function onColumnDrop(index: number, event: DragEvent) {
+  const state = columnDragState.value;
+  if (!state) return;
+  event.preventDefault();
+  moveColumnTo(state.sourceIndex, columnDragInsertionIndex(index, event));
+  columnDragState.value = null;
+}
+
+function onColumnDragEnd() {
+  columnDragState.value = null;
+}
+
+function columnRowClass(column: EditableStructureColumn, index: number) {
+  const dragState = columnDragState.value;
+  return {
+    "bg-destructive/5 opacity-60": column.markedForDrop,
+    "opacity-55": dragState?.columnId === column.id,
+    "bg-primary/5": dragState && (dragState.insertionIndex === index || dragState.insertionIndex === index + 1),
+    "[&>td]:border-t-2 [&>td]:border-t-primary": dragState?.insertionIndex === index,
+    "[&>td]:border-b-2 [&>td]:border-b-primary": dragState?.insertionIndex === index + 1,
+  };
+}
+
+function columnDragInsertionIndex(index: number, event: DragEvent): number {
+  const target = event.currentTarget;
+  if (!(target instanceof HTMLElement)) return index;
+  const rect = target.getBoundingClientRect();
+  return event.clientY > rect.top + rect.height / 2 ? index + 1 : index;
 }
 
 function toggleDropColumn(column: EditableStructureColumn) {
@@ -1154,6 +1434,7 @@ async function applyChanges() {
     ddlFetched.value = false;
     ddlContent.value = "";
     if (isCreateMode.value) {
+      clearDraft();
       emit("saved", tableComment.value !== originalTableComment.value);
       emit("close");
     } else {
@@ -1222,15 +1503,26 @@ function unregisterStructureEditorShortcuts() {
 onMounted(() => {
   resetState();
   registerStructureEditorShortcuts();
-  void loadStructure();
+  void loadDynamicDataTypeOptions();
+  if (props.draft?.initialized) {
+    restoreDraft(props.draft);
+  } else if (isCreateMode.value) {
+    markDraftHydratedAndSync();
+  } else {
+    void loadStructure(false, FULL_STRUCTURE_REFRESH_SCOPE, true, { blockSecondaryMetadata: true });
+  }
 });
 
 onActivated(() => {
   registerStructureEditorShortcuts();
-  if (!isCreateMode.value) void loadStructure(true);
+  void loadDynamicDataTypeOptions();
+  if (props.draft?.initialized && !draftHydrated) {
+    restoreDraft(props.draft);
+  }
 });
 onDeactivated(unregisterStructureEditorShortcuts);
 onBeforeUnmount(() => {
+  stopColumnDragTracking();
   unregisterStructureEditorShortcuts();
   clearSqlPreviewState();
   persistStructureDensity();
@@ -1255,13 +1547,22 @@ watch(tableMetadataCapabilities, (capabilities) => {
   if (!supported) activeTab.value = firstStructureMetadataTab(capabilities);
 });
 
+watch([() => props.connectionId, () => props.database, databaseType], () => {
+  void loadDynamicDataTypeOptions();
+});
+
 watch(
   [isCreateMode, databaseType, () => props.schema, () => props.tableName, newTableName, tableComment, columns, indexes, foreignKeys, triggers],
   () => {
     scheduleSqlPreviewRefresh();
+    syncDraftToParent();
   },
   { deep: true, immediate: true },
 );
+
+watch(activeTab, () => {
+  syncDraftToParent();
+});
 
 watch(secondaryMetadataLoading, (value) => {
   if (value || !deferredSqlPreviewRefresh) return;
@@ -1296,7 +1597,7 @@ watch(activeTab, (tab) => {
       <Database :class="[structureIconClass, 'text-muted-foreground']" />
       <span class="min-w-0 flex-1 truncate font-medium">{{ targetLabel || t("editor.noDatabase") }}</span>
       <Badge variant="outline">{{ connection?.driver_label || databaseType }}</Badge>
-      <Button v-if="!isCreateMode" variant="ghost" size="sm" :class="structureToolbarButtonClass" :disabled="loading || saving" @click="loadStructure()">
+      <Button v-if="!isCreateMode" variant="ghost" size="sm" :class="structureToolbarButtonClass" :disabled="loading || saving" @click="reloadStructureFromDatabase">
         <RefreshCw :class="structureIconClass" />
         {{ t("structureEditor.refresh") }}
       </Button>
@@ -1340,22 +1641,24 @@ watch(activeTab, (tab) => {
                 <div ref="structureDensityMenuRef" class="relative">
                   <button
                     type="button"
-                    class="flex h-[var(--structure-control-height)] min-w-[76px] items-center justify-between rounded-md border bg-background px-[var(--structure-control-px)] text-[length:var(--structure-font-size)] outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/40"
+                    class="grid h-[var(--structure-control-height)] min-w-[76px] grid-cols-[1fr_var(--structure-control-height)] items-center rounded-[6px] border bg-background pl-[var(--structure-control-px)] text-[length:var(--structure-font-size)] outline-none hover:bg-muted focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25"
                     :aria-label="t('structureEditor.density')"
                     :aria-expanded="structureDensityMenuOpen"
                     aria-haspopup="listbox"
                     @click="toggleStructureDensityMenu"
                     @keydown="onStructureDensityKeydown"
                   >
-                    <span class="truncate">{{ structureDensityOptions.find((option) => option.value === localStructureDensity)?.label }}</span>
-                    <ChevronDown :class="[structureIconClass, 'ml-1 shrink-0 opacity-50']" />
+                    <span class="min-w-0 text-center truncate">{{ structureDensityOptions.find((option) => option.value === localStructureDensity)?.label }}</span>
+                    <span class="flex h-full items-center justify-center">
+                      <ChevronDown :class="[structureIconClass, 'shrink-0 opacity-50']" />
+                    </span>
                   </button>
-                  <div v-if="structureDensityMenuOpen" class="absolute right-0 top-[calc(100%+4px)] z-50 min-w-full rounded-lg bg-popover p-1 text-popover-foreground shadow-md ring-1 ring-foreground/10" role="listbox" :aria-label="t('structureEditor.density')">
+                  <div v-if="structureDensityMenuOpen" class="absolute right-0 top-[calc(100%+4px)] z-50 min-w-full rounded-[6px] bg-popover p-1 text-popover-foreground shadow-md ring-1 ring-foreground/10" role="listbox" :aria-label="t('structureEditor.density')">
                     <button
                       v-for="option in structureDensityOptions"
                       :key="option.value"
                       type="button"
-                      class="flex h-7 w-full items-center rounded-md px-1.5 text-left text-[length:var(--structure-font-size)] outline-none hover:bg-accent hover:text-accent-foreground"
+                      class="flex h-7 w-full items-center rounded-[6px] px-1.5 text-left text-[length:var(--structure-font-size)] outline-none hover:bg-accent hover:text-accent-foreground"
                       :class="option.value === localStructureDensity ? 'bg-accent text-accent-foreground' : ''"
                       role="option"
                       :aria-selected="option.value === localStructureDensity"
@@ -1416,7 +1719,7 @@ watch(activeTab, (tab) => {
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="(column, index) in columns" :key="column.id" :class="column.markedForDrop ? 'bg-destructive/5 opacity-60' : ''" :data-new-column-row="!column.original ? 'true' : undefined">
+                <tr v-for="(column, index) in columns" :key="column.id" :class="columnRowClass(column, index)" :data-new-column-row="!column.original ? 'true' : undefined" :data-column-row-index="index" @dragover="onColumnDragOver(index, $event)" @drop="onColumnDrop(index, $event)">
                   <td :class="[structureCellClass, 'text-muted-foreground']">
                     <div class="flex items-center gap-1">
                       <span>{{ index + 1 }}</span>
@@ -1442,7 +1745,12 @@ watch(activeTab, (tab) => {
                     <Input v-else :model-value="splitDataType(column.dataType).baseType" :class="[structureMonoControlClass, 'w-full']" disabled />
                   </td>
                   <td v-if="columnEditorControls.length" :class="structureCellClass">
-                    <Input :model-value="splitDataType(column.dataType).params" :class="structureMonoControlClass" :disabled="isColumnLengthDisabled(column)" @update:model-value="column.dataType = combineDataTypeForDatabase(databaseType, splitDataType(column.dataType).baseType, String($event))" />
+                    <Input
+                      :model-value="dataTypeLengthInputValue(databaseType, column.dataType)"
+                      :class="structureMonoControlClass"
+                      :disabled="isColumnLengthDisabled(column)"
+                      @update:model-value="column.dataType = combineDataTypeForDatabase(databaseType, splitDataType(column.dataType).baseType, String($event))"
+                    />
                   </td>
                   <td v-if="columnEditorControls.nullable" :class="structureCellClass">
                     <label class="flex items-center gap-1.5">
@@ -1500,7 +1808,7 @@ watch(activeTab, (tab) => {
                           </div>
                           <textarea
                             v-model="column.comment"
-                            class="min-h-36 w-full resize-y rounded-md border bg-background px-[var(--structure-control-px)] py-[var(--structure-cell-py)] text-[length:var(--structure-font-size)] leading-5 outline-none focus-visible:ring-2 focus-visible:ring-ring/40 disabled:cursor-not-allowed disabled:opacity-50"
+                            class="min-h-36 w-full resize-y rounded-[6px] border bg-background px-[var(--structure-control-px)] py-[var(--structure-cell-py)] text-[length:var(--structure-font-size)] leading-5 outline-none focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25 disabled:cursor-not-allowed disabled:opacity-50"
                             :placeholder="t('structureEditor.commentPlaceholder')"
                             :disabled="isColumnCommentDisabled(column)"
                           />
@@ -1562,7 +1870,7 @@ watch(activeTab, (tab) => {
                             }
                           "
                         >
-                          <SelectTrigger class="h-[var(--structure-control-height)] w-28 rounded-md px-[var(--structure-control-px)] text-[length:var(--structure-font-size)]">
+                          <SelectTrigger class="h-[var(--structure-control-height)] w-28 rounded-[6px] px-[var(--structure-control-px)] text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25">
                             <SelectValue />
                           </SelectTrigger>
                           <SelectContent>
@@ -1637,14 +1945,22 @@ watch(activeTab, (tab) => {
                   </td>
                   <td :class="structureLastCellClass">
                     <div class="flex min-w-0 items-center justify-start gap-0.5 overflow-hidden">
-                      <template v-if="canShowColumnMoveControls || !column.original">
-                        <Button type="button" variant="ghost" size="icon" :class="structureActionButtonClass" :disabled="!canMoveColumn(index, -1)" :title="t('structureEditor.moveColumnUp')" :aria-label="t('structureEditor.moveColumnUp')" @click.stop.prevent="moveColumn(index, -1)">
-                          <ChevronUp :class="structureIconClass" />
-                        </Button>
-                        <Button type="button" variant="ghost" size="icon" :class="structureActionButtonClass" :disabled="!canMoveColumn(index, 1)" :title="t('structureEditor.moveColumnDown')" :aria-label="t('structureEditor.moveColumnDown')" @click.stop.prevent="moveColumn(index, 1)">
-                          <ChevronDown :class="structureIconClass" />
-                        </Button>
-                      </template>
+                      <Button
+                        v-if="canShowColumnDragControls || !column.original"
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        :class="[structureActionButtonClass, canDragColumn(index) ? 'cursor-grab active:cursor-grabbing' : 'cursor-not-allowed']"
+                        :disabled="!canDragColumn(index)"
+                        :title="t('structureEditor.dragColumn')"
+                        :aria-label="t('structureEditor.dragColumn')"
+                        :draggable="canDragColumn(index)"
+                        @pointerdown="onColumnDragPointerDown(index, $event)"
+                        @dragstart="onColumnDragStart(index, $event)"
+                        @dragend="onColumnDragEnd"
+                      >
+                        <ListChevronsUpDown :class="structureIconClass" />
+                      </Button>
                       <Button
                         v-if="column.original"
                         variant="ghost"
@@ -1722,7 +2038,7 @@ watch(activeTab, (tab) => {
                   </td>
                   <td :class="structureCellClass">
                     <Select v-if="indexTypeOptions.length > 0" :model-value="index.indexType || 'BTREE'" :disabled="!canEditIndexDraft(index)" @update:model-value="(v: any) => (index.indexType = String(v ?? ''))">
-                      <SelectTrigger class="h-[var(--structure-control-height)] w-full rounded-md px-[var(--structure-control-px)] font-mono text-[length:var(--structure-font-size)]">
+                      <SelectTrigger class="h-[var(--structure-control-height)] w-full rounded-[6px] px-[var(--structure-control-px)] font-mono text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25">
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
@@ -1801,7 +2117,7 @@ watch(activeTab, (tab) => {
                 </div>
                 <div class="mt-1.5 grid grid-cols-[minmax(110px,0.5fr)_minmax(110px,0.5fr)_1fr] gap-1.5">
                   <Select :model-value="fk.onDelete || '__default'" :disabled="!canEditForeignKeyDraft(fk)" @update:model-value="(v: any) => (fk.onDelete = String(v === '__default' ? '' : (v ?? '')))">
-                    <SelectTrigger class="h-[var(--structure-control-height)] rounded-md px-[var(--structure-control-px)] text-[length:var(--structure-font-size)]">
+                    <SelectTrigger class="h-[var(--structure-control-height)] rounded-[6px] px-[var(--structure-control-px)] text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25">
                       <SelectValue :placeholder="t('structureEditor.onDelete')" />
                     </SelectTrigger>
                     <SelectContent>
@@ -1809,7 +2125,7 @@ watch(activeTab, (tab) => {
                     </SelectContent>
                   </Select>
                   <Select :model-value="fk.onUpdate || '__default'" :disabled="!canEditForeignKeyDraft(fk)" @update:model-value="(v: any) => (fk.onUpdate = String(v === '__default' ? '' : (v ?? '')))">
-                    <SelectTrigger class="h-[var(--structure-control-height)] rounded-md px-[var(--structure-control-px)] text-[length:var(--structure-font-size)]">
+                    <SelectTrigger class="h-[var(--structure-control-height)] rounded-[6px] px-[var(--structure-control-px)] text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25">
                       <SelectValue :placeholder="t('structureEditor.onUpdate')" />
                     </SelectTrigger>
                     <SelectContent>
@@ -1835,7 +2151,7 @@ watch(activeTab, (tab) => {
                 <div class="grid grid-cols-[minmax(140px,1fr)_110px_110px_auto] gap-1.5">
                   <Input v-model="trigger.name" :class="structureControlClass" :placeholder="t('structureEditor.triggerName')" :disabled="!canEditTriggerDraft(trigger)" />
                   <Select v-model="trigger.timing" :disabled="!canEditTriggerDraft(trigger)">
-                    <SelectTrigger class="h-[var(--structure-control-height)] rounded-md px-[var(--structure-control-px)] text-[length:var(--structure-font-size)]">
+                    <SelectTrigger class="h-[var(--structure-control-height)] rounded-[6px] px-[var(--structure-control-px)] text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
@@ -1843,7 +2159,7 @@ watch(activeTab, (tab) => {
                     </SelectContent>
                   </Select>
                   <Select v-model="trigger.event" :disabled="!canEditTriggerDraft(trigger)">
-                    <SelectTrigger class="h-[var(--structure-control-height)] rounded-md px-[var(--structure-control-px)] text-[length:var(--structure-font-size)]">
+                    <SelectTrigger class="h-[var(--structure-control-height)] rounded-[6px] px-[var(--structure-control-px)] text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
@@ -1863,7 +2179,7 @@ watch(activeTab, (tab) => {
                 </div>
                 <textarea
                   v-model="trigger.statement"
-                  class="mt-1.5 min-h-28 w-full resize-y rounded-md border bg-background px-[var(--structure-control-px)] py-[var(--structure-cell-py)] font-mono text-[length:var(--structure-font-size)] leading-5 outline-none focus-visible:ring-2 focus-visible:ring-ring/40 disabled:cursor-not-allowed disabled:opacity-50"
+                  class="mt-1.5 min-h-28 w-full resize-y rounded-[6px] border bg-background px-[var(--structure-control-px)] py-[var(--structure-cell-py)] font-mono text-[length:var(--structure-font-size)] leading-5 outline-none focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25 disabled:cursor-not-allowed disabled:opacity-50"
                   :placeholder="t('structureEditor.triggerStatement')"
                   :disabled="!canEditTriggerDraft(trigger)"
                 />

@@ -143,11 +143,24 @@ pub fn h2_jdbc_file_base_path(path: &str) -> String {
 
 pub fn h2_file_path_from_jdbc_url(connection_string: &str) -> Option<String> {
     let connection_string = connection_string.trim();
-    let prefix = "jdbc:h2:file:";
-    if connection_string.get(..prefix.len())?.eq_ignore_ascii_case(prefix) {
-        return Some(connection_string[prefix.len()..].split(';').next().unwrap_or("").to_string());
-    }
-    None
+    h2_file_jdbc_url_prefix(connection_string).map(|prefix| {
+        let raw_path = connection_string[prefix.len()..].split(';').next().unwrap_or("");
+        if prefix.eq_ignore_ascii_case("jdbc:h2:split:") {
+            raw_path
+                .split_once(':')
+                .and_then(|(block_size, path)| block_size.chars().all(|ch| ch.is_ascii_digit()).then_some(path))
+                .unwrap_or(raw_path)
+                .to_string()
+        } else {
+            raw_path.to_string()
+        }
+    })
+}
+
+fn h2_file_jdbc_url_prefix(connection_string: &str) -> Option<&'static str> {
+    ["jdbc:h2:file:", "jdbc:h2:split:"]
+        .into_iter()
+        .find(|prefix| connection_string.get(..prefix.len()).is_some_and(|value| value.eq_ignore_ascii_case(prefix)))
 }
 
 fn normalize_h2_file_jdbc_url(connection_string: &str) -> Option<String> {
@@ -167,10 +180,7 @@ fn normalize_h2_file_jdbc_url(connection_string: &str) -> Option<String> {
 }
 
 fn is_h2_file_jdbc_url(connection_string: &str) -> bool {
-    connection_string
-        .trim()
-        .get(.."jdbc:h2:file:".len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("jdbc:h2:file:"))
+    h2_file_jdbc_url_prefix(connection_string.trim()).is_some()
 }
 
 fn mongo_uri_database(uri: &str) -> Option<String> {
@@ -239,9 +249,6 @@ pub fn oracle_error_with_driver_hint(config: &ConnectionConfig, err: &str) -> St
 
 pub fn oracle_alternate_connect_configs(config: &ConnectionConfig, err: &str) -> Vec<ConnectionConfig> {
     if config.db_type != DatabaseType::Oracle {
-        return Vec::new();
-    }
-    if config.driver_profile.as_deref() == Some("oracle-10g") {
         return Vec::new();
     }
     if config.connection_string.as_deref().is_some_and(|value| !value.trim().is_empty()) {
@@ -390,21 +397,6 @@ fn postgres_like_agent_jdbc_connection_string(
     };
     let base = format!("jdbc:{scheme}://{host}:{port}/{}", database.trim());
     append_agent_url_params(base, config.url_params.as_deref())
-}
-
-pub fn should_retry_oracle_with_10g_driver(config: &ConnectionConfig, err: &str) -> bool {
-    !oracle_auth_fallback_profiles(config, err).is_empty()
-}
-
-pub fn oracle_auth_fallback_profiles(config: &ConnectionConfig, err: &str) -> Vec<&'static str> {
-    if config.db_type != DatabaseType::Oracle {
-        return Vec::new();
-    }
-    let normalized = err.to_lowercase();
-    if !normalized.contains("ora-28040") && !normalized.contains("no matching authentication protocol") {
-        return Vec::new();
-    }
-    Vec::new()
 }
 
 pub fn oracle_alternate_connect_config(config: &ConnectionConfig, err: &str) -> Option<ConnectionConfig> {
@@ -606,6 +598,7 @@ mod tests {
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
             redis_key_separator: default_redis_key_separator(),
+            redis_scan_page_size: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -660,6 +653,23 @@ mod tests {
         assert_eq!(params["port"], 0);
         assert_eq!(params["database"], "file:/tmp/app;AUTO_SERVER=TRUE");
         assert_eq!(params["connection_string"], "jdbc:h2:file:/tmp/app;AUTO_SERVER=TRUE");
+    }
+
+    #[test]
+    fn h2_split_connection_string_is_treated_as_file_mode() {
+        let mut cfg = config(DatabaseType::H2, None);
+        cfg.connection_string = Some("jdbc:h2:split:28:C:/dbx-test/h2/sample-db;AUTO_SERVER=TRUE".to_string());
+
+        let params = agent_connect_params(&cfg, "127.0.0.1", 9092, "test");
+
+        assert_eq!(
+            h2_file_path_from_jdbc_url(cfg.connection_string.as_deref().unwrap()).as_deref(),
+            Some("C:/dbx-test/h2/sample-db")
+        );
+        assert_eq!(params["host"], "");
+        assert_eq!(params["port"], 0);
+        assert_eq!(params["database"], "split:28:C:/dbx-test/h2/sample-db;AUTO_SERVER=TRUE");
+        assert_eq!(params["connection_string"], "jdbc:h2:split:28:C:/dbx-test/h2/sample-db;AUTO_SERVER=TRUE");
     }
 
     #[test]
@@ -721,10 +731,9 @@ mod tests {
     }
 
     #[test]
-    fn oracle_listener_error_hint_skips_other_databases() {
+    fn oracle_listener_error_hint_skips_non_oracle_databases() {
         let err = "Agent RPC error (-1): ORA-12541: TNS:no listener";
         let mut cfg = config(DatabaseType::Oracle, Some("ORCL"));
-        cfg.driver_profile = Some("oracle-legacy".to_string());
 
         assert!(oracle_error_with_driver_hint(&cfg, err).contains("Service Name"));
 
@@ -879,20 +888,6 @@ mod tests {
         assert_eq!(retry.connection_string.as_deref(), Some("jdbc:oracle:thin:@127.0.0.1:3306:ORCL"));
         assert!(oracle_alternate_connect_config(&retry, "ORA-01017: invalid username/password").is_none());
         assert!(oracle_alternate_connect_config(&cfg, "ORA-12541: TNS:no listener").is_some());
-    }
-
-    #[test]
-    fn oracle_auth_errors_do_not_switch_driver_profiles() {
-        let mut cfg = config(DatabaseType::Oracle, Some("ORCL"));
-        cfg.driver_profile = Some("oracle".to_string());
-
-        assert!(oracle_auth_fallback_profiles(&cfg, "ORA-28040: No matching authentication protocol").is_empty());
-
-        cfg.driver_profile = Some("oracle-legacy".to_string());
-        assert!(oracle_auth_fallback_profiles(&cfg, "ORA-28040: No matching authentication protocol").is_empty());
-
-        cfg.driver_profile = Some("oracle-10g".to_string());
-        assert!(oracle_auth_fallback_profiles(&cfg, "ORA-28040: No matching authentication protocol").is_empty());
     }
 
     #[test]

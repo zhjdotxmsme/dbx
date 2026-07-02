@@ -3,7 +3,7 @@ import { ref, watch, shallowRef, computed, onMounted, onUnmounted, nextTick } fr
 import type { Ref } from "vue";
 import type { EditorView as EditorViewType } from "@codemirror/view";
 import { useI18n } from "vue-i18n";
-import { AlertTriangle, CheckCircle2, CircleHelp, Cloud, Copy, Download, ExternalLink, GripVertical, Loader2, Moon, PackageSearch, Pencil, RefreshCw, RotateCcw, Settings, Sun, SunMoon, Terminal, Trash2, Upload, X } from "@lucide/vue";
+import { AlertTriangle, CheckCircle2, CircleHelp, Cloud, Copy, Download, ExternalLink, GripVertical, Loader2, Moon, PackageSearch, Pencil, Plus, RefreshCw, RotateCcw, Settings, Sun, SunMoon, Terminal, Trash2, Upload, X } from "@lucide/vue";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -25,6 +25,7 @@ import {
   DEFAULT_EDITOR_SETTINGS,
   DEFAULT_DESKTOP_SETTINGS,
   DEFAULT_SIDEBAR_TABLE_PAGE_SIZE,
+  normalizeAiEnv,
   type AiProvider,
   type AiApiStyle,
   type AiAuthMethod,
@@ -33,10 +34,12 @@ import {
   type DesktopIconTheme,
   type InterfaceLayout,
   type DisconnectTabHandlingMode,
+  type UpdateDownloadSource,
   type CustomThemeColors,
   type CustomTheme,
 } from "@/stores/settingsStore";
 import { loadEditorTheme, editorFontTheme } from "@/lib/editorThemes";
+import { formatAiModelOption } from "@/lib/aiModelPresentation";
 import ThemeCustomizerDialog from "./ThemeCustomizerDialog.vue";
 import { isTauriRuntime } from "@/lib/tauriRuntime";
 import { useTheme } from "@/composables/useTheme";
@@ -63,7 +66,8 @@ import { SHORTCUT_DEFINITIONS, findShortcutConflict, normalizeShortcutSettings, 
 import { normalizeSidebarHiddenTablePrefixes } from "@/lib/sidebarTableNameDisplay";
 import { normalizeSqlFormatterSettings, type SqlFormatterSettings } from "@/lib/sqlFormatterConfig";
 import { EMPTY_TABLE_COLUMN_TEMPLATE_DATA_TYPE, parseTableColumnTemplateFields, TABLE_COLUMN_TEMPLATE_DATABASE_TYPES } from "@/lib/tableColumnTemplates";
-import { combineDataTypeForDatabase, getDataTypeOptions, getDefaultLengthForType, isDataTypeLengthDisabled, splitDataType } from "@/lib/tableStructureEditorState";
+import { buildMcpCodexConfig, buildMcpJsonConfig, buildMcpOpenCodeConfig, buildMcpVsCodeConfig, type McpEnvEntry } from "@/lib/mcpConfigTemplates";
+import { combineDataTypeForDatabase, dataTypeLengthInputValue, getDataTypeOptions, getDefaultLengthForType, isDataTypeLengthDisabled, splitDataType } from "@/lib/tableStructureEditorState";
 import type { DatabaseType, SqlSnippet } from "@/types/database";
 import { uuid } from "@/lib/utils";
 import { DEFAULT_SQL_SNIPPETS } from "@/lib/sqlCompletion";
@@ -75,6 +79,8 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { currentLocale, setLocale, type Locale } from "@/i18n";
 import { LOCALE_OPTIONS } from "@/lib/localeOptions";
+import { DEFAULT_WEB_DAV_AUTO_UPLOAD_INTERVAL_MINUTES, DEFAULT_WEB_DAV_REMOTE_PATH, normalizedWebDavAutoUploadInterval, writeWebDavAutoUploadFields } from "@/lib/webdavAutoUploadConfig";
+import { apiUrl } from "@/lib/webPath";
 
 const { t } = useI18n();
 const settingsStore = useSettingsStore();
@@ -109,6 +115,12 @@ interface TableColumnTemplateGridRow {
   required: boolean;
   comment: string;
   overrides: TableColumnTemplateOverrideRow[];
+}
+
+interface AiEnvRow {
+  id: string;
+  key: string;
+  value: string;
 }
 
 function tableColumnTemplateRowsFromSettings(lines: readonly string[]): TableColumnTemplateGridRow[] {
@@ -191,6 +203,7 @@ const debugLogDownloaded = ref(false);
 const editShowColumnCommentsInHeader = ref(settingsStore.editorSettings.showColumnCommentsInHeader);
 const editShowColumnTypesInHeader = ref(settingsStore.editorSettings.showColumnTypesInHeader);
 const editCompactColumnHeaderActions = ref(settingsStore.editorSettings.compactColumnHeaderActions);
+const editDataGridQuickEntry = ref(settingsStore.editorSettings.dataGridQuickEntry);
 const editInfiniteScroll = ref(settingsStore.editorSettings.infiniteScroll);
 const editInfiniteScrollMaxRows = ref(settingsStore.editorSettings.infiniteScrollMaxRows);
 const editTableColumnTemplateRows = ref<TableColumnTemplateGridRow[]>(tableColumnTemplateRowsFromSettings(settingsStore.editorSettings.tableColumnTemplateFields));
@@ -198,7 +211,6 @@ const editTableColumnTemplateDatabaseType = ref<DatabaseType>(TABLE_COLUMN_TEMPL
 const tableColumnTemplateSectionRef = ref<HTMLElement | null>(null);
 const draggedTableColumnTemplateRowId = ref<string | null>(null);
 let tableColumnTemplatePointerDragCleanup: (() => void) | null = null;
-const editRedisScanPageSize = ref(settingsStore.editorSettings.redisScanPageSize);
 const editShortcuts = ref(normalizeShortcutSettings(settingsStore.editorSettings.shortcuts));
 const editSqlFormatter = ref<SqlFormatterSettings>(normalizeSqlFormatterSettings(settingsStore.editorSettings.sqlFormatter));
 const sqlFormatterConfigValid = ref(true);
@@ -217,8 +229,8 @@ const editExportBatchSize = ref(settingsStore.editorSettings.exportBatchSize);
 const editExportRowLimitEnabled = ref(settingsStore.editorSettings.exportRowLimitEnabled);
 const editExportRowLimit = ref(settingsStore.editorSettings.exportRowLimit);
 const editQueryExportKeysetOptimizationEnabled = ref(settingsStore.editorSettings.queryExportKeysetOptimizationEnabled);
+const editUpdateDownloadSource = ref<UpdateDownloadSource>(settingsStore.editorSettings.updateDownloadSource);
 const editToolbarItems = ref({ ...settingsStore.editorSettings.toolbarItems });
-const redisScanPageSizeOptions = [200, 1000, 5000, 10000];
 const systemFonts = ref<string[]>([]);
 const systemFontsLoading = ref(false);
 const systemFontsLoaded = ref(false);
@@ -466,10 +478,10 @@ watch(
       editShowColumnCommentsInHeader.value = settingsStore.editorSettings.showColumnCommentsInHeader;
       editShowColumnTypesInHeader.value = settingsStore.editorSettings.showColumnTypesInHeader;
       editCompactColumnHeaderActions.value = settingsStore.editorSettings.compactColumnHeaderActions;
+      editDataGridQuickEntry.value = settingsStore.editorSettings.dataGridQuickEntry;
       editInfiniteScroll.value = settingsStore.editorSettings.infiniteScroll;
       editInfiniteScrollMaxRows.value = settingsStore.editorSettings.infiniteScrollMaxRows;
       editTableColumnTemplateRows.value = tableColumnTemplateRowsFromSettings(settingsStore.editorSettings.tableColumnTemplateFields);
-      editRedisScanPageSize.value = settingsStore.editorSettings.redisScanPageSize;
       editShortcuts.value = normalizeShortcutSettings(settingsStore.editorSettings.shortcuts);
       editSqlFormatter.value = normalizeSqlFormatterSettings(settingsStore.editorSettings.sqlFormatter);
       sqlFormatterConfigValid.value = true;
@@ -486,6 +498,7 @@ watch(
       editExportRowLimitEnabled.value = settingsStore.editorSettings.exportRowLimitEnabled;
       editExportRowLimit.value = settingsStore.editorSettings.exportRowLimit;
       editQueryExportKeysetOptimizationEnabled.value = settingsStore.editorSettings.queryExportKeysetOptimizationEnabled;
+      editUpdateDownloadSource.value = settingsStore.editorSettings.updateDownloadSource;
       editToolbarItems.value = { ...settingsStore.editorSettings.toolbarItems };
       editSnippets.value = settingsStore.editorSettings.snippets.map((s) => ({ ...s }));
     }
@@ -529,10 +542,10 @@ function hasChanges(): boolean {
     editShowColumnCommentsInHeader.value !== settingsStore.editorSettings.showColumnCommentsInHeader ||
     editShowColumnTypesInHeader.value !== settingsStore.editorSettings.showColumnTypesInHeader ||
     editCompactColumnHeaderActions.value !== settingsStore.editorSettings.compactColumnHeaderActions ||
+    editDataGridQuickEntry.value !== settingsStore.editorSettings.dataGridQuickEntry ||
     editInfiniteScroll.value !== settingsStore.editorSettings.infiniteScroll ||
     editInfiniteScrollMaxRows.value !== settingsStore.editorSettings.infiniteScrollMaxRows ||
     JSON.stringify(normalizedEditTableColumnTemplateFields.value) !== JSON.stringify(settingsStore.editorSettings.tableColumnTemplateFields) ||
-    editRedisScanPageSize.value !== settingsStore.editorSettings.redisScanPageSize ||
     JSON.stringify(editShortcuts.value) !== JSON.stringify(settingsStore.editorSettings.shortcuts) ||
     JSON.stringify(editSqlFormatter.value) !== JSON.stringify(normalizeSqlFormatterSettings(settingsStore.editorSettings.sqlFormatter)) ||
     editSidebarActivation.value !== settingsStore.editorSettings.sidebarActivation ||
@@ -547,6 +560,7 @@ function hasChanges(): boolean {
     editExportRowLimitEnabled.value !== settingsStore.editorSettings.exportRowLimitEnabled ||
     editExportRowLimit.value !== settingsStore.editorSettings.exportRowLimit ||
     editQueryExportKeysetOptimizationEnabled.value !== settingsStore.editorSettings.queryExportKeysetOptimizationEnabled ||
+    editUpdateDownloadSource.value !== settingsStore.editorSettings.updateDownloadSource ||
     JSON.stringify(editToolbarItems.value) !== JSON.stringify(settingsStore.editorSettings.toolbarItems) ||
     JSON.stringify(normalizeSidebarHiddenTablePrefixes(editSidebarHiddenTablePrefixes.value)) !== JSON.stringify(settingsStore.editorSettings.sidebarHiddenTablePrefixes) ||
     JSON.stringify(editSnippets.value) !== JSON.stringify(settingsStore.editorSettings.snippets)
@@ -556,6 +570,7 @@ function hasChanges(): boolean {
 async function persistSettings() {
   if (hasApplyBlocker.value) return;
   const sidebarObjectDisplayChanged = editSidebarObjectDisplay.value !== settingsStore.editorSettings.sidebarObjectDisplay;
+  const sidebarTablePageSizeChanged = editSidebarTablePageSize.value !== (settingsStore.desktopSettings.sidebar_table_page_size ?? DEFAULT_SIDEBAR_TABLE_PAGE_SIZE);
   settingsStore.updateEditorSettings({
     fontFamily: editFontFamily.value,
     fontSize: editFontSize.value,
@@ -572,10 +587,10 @@ async function persistSettings() {
     showColumnCommentsInHeader: editShowColumnCommentsInHeader.value,
     showColumnTypesInHeader: editShowColumnTypesInHeader.value,
     compactColumnHeaderActions: editCompactColumnHeaderActions.value,
+    dataGridQuickEntry: editDataGridQuickEntry.value,
     infiniteScroll: editInfiniteScroll.value,
     infiniteScrollMaxRows: editInfiniteScrollMaxRows.value,
     tableColumnTemplateFields: normalizedEditTableColumnTemplateFields.value,
-    redisScanPageSize: editRedisScanPageSize.value,
     shortcuts: editShortcuts.value,
     sqlFormatter: normalizeSqlFormatterSettings(editSqlFormatter.value),
     sidebarActivation: editSidebarActivation.value,
@@ -591,6 +606,7 @@ async function persistSettings() {
     exportRowLimitEnabled: editExportRowLimitEnabled.value,
     exportRowLimit: editExportRowLimit.value,
     queryExportKeysetOptimizationEnabled: editQueryExportKeysetOptimizationEnabled.value,
+    updateDownloadSource: editUpdateDownloadSource.value,
     toolbarItems: { ...editToolbarItems.value },
     snippets: editSnippets.value,
   });
@@ -605,6 +621,8 @@ async function persistSettings() {
   desktopCloseBehaviorResetPending.value = false;
   if (sidebarObjectDisplayChanged) {
     await connectionStore.refreshAllTree();
+  } else if (sidebarTablePageSizeChanged) {
+    await connectionStore.refreshSidebarObjectPagination();
   }
 }
 
@@ -656,6 +674,7 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editShowColumnCommentsInHeader.value = DEFAULT_EDITOR_SETTINGS.showColumnCommentsInHeader;
     editShowColumnTypesInHeader.value = DEFAULT_EDITOR_SETTINGS.showColumnTypesInHeader;
     editCompactColumnHeaderActions.value = DEFAULT_EDITOR_SETTINGS.compactColumnHeaderActions;
+    editDataGridQuickEntry.value = DEFAULT_EDITOR_SETTINGS.dataGridQuickEntry;
     editInfiniteScroll.value = DEFAULT_EDITOR_SETTINGS.infiniteScroll;
     editInfiniteScrollMaxRows.value = DEFAULT_EDITOR_SETTINGS.infiniteScrollMaxRows;
     editTableColumnTemplateRows.value = tableColumnTemplateRowsFromSettings(DEFAULT_EDITOR_SETTINGS.tableColumnTemplateFields);
@@ -663,12 +682,12 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editExportRowLimitEnabled.value = DEFAULT_EDITOR_SETTINGS.exportRowLimitEnabled;
     editExportRowLimit.value = DEFAULT_EDITOR_SETTINGS.exportRowLimit;
     editQueryExportKeysetOptimizationEnabled.value = DEFAULT_EDITOR_SETTINGS.queryExportKeysetOptimizationEnabled;
-  } else if (tab === "redis") {
-    editRedisScanPageSize.value = DEFAULT_EDITOR_SETTINGS.redisScanPageSize;
   } else if (tab === "shortcuts") {
     editShortcuts.value = normalizeShortcutSettings(DEFAULT_EDITOR_SETTINGS.shortcuts);
   } else if (tab === "snippets") {
     editSnippets.value = DEFAULT_SQL_SNIPPETS.map((s) => ({ ...s }));
+  } else if (tab === "about") {
+    editUpdateDownloadSource.value = DEFAULT_EDITOR_SETTINGS.updateDownloadSource;
   }
 }
 
@@ -694,10 +713,10 @@ function resetAllDefaults() {
   editShowColumnCommentsInHeader.value = DEFAULT_EDITOR_SETTINGS.showColumnCommentsInHeader;
   editShowColumnTypesInHeader.value = DEFAULT_EDITOR_SETTINGS.showColumnTypesInHeader;
   editCompactColumnHeaderActions.value = DEFAULT_EDITOR_SETTINGS.compactColumnHeaderActions;
+  editDataGridQuickEntry.value = DEFAULT_EDITOR_SETTINGS.dataGridQuickEntry;
   editInfiniteScroll.value = DEFAULT_EDITOR_SETTINGS.infiniteScroll;
   editInfiniteScrollMaxRows.value = DEFAULT_EDITOR_SETTINGS.infiniteScrollMaxRows;
   editTableColumnTemplateRows.value = tableColumnTemplateRowsFromSettings(DEFAULT_EDITOR_SETTINGS.tableColumnTemplateFields);
-  editRedisScanPageSize.value = DEFAULT_EDITOR_SETTINGS.redisScanPageSize;
   editShortcuts.value = normalizeShortcutSettings(DEFAULT_EDITOR_SETTINGS.shortcuts);
   editSqlFormatter.value = normalizeSqlFormatterSettings(DEFAULT_EDITOR_SETTINGS.sqlFormatter);
   sqlFormatterConfigValid.value = true;
@@ -714,6 +733,7 @@ function resetAllDefaults() {
   editExportRowLimitEnabled.value = DEFAULT_EDITOR_SETTINGS.exportRowLimitEnabled;
   editExportRowLimit.value = DEFAULT_EDITOR_SETTINGS.exportRowLimit;
   editQueryExportKeysetOptimizationEnabled.value = DEFAULT_EDITOR_SETTINGS.queryExportKeysetOptimizationEnabled;
+  editUpdateDownloadSource.value = DEFAULT_EDITOR_SETTINGS.updateDownloadSource;
   editToolbarItems.value = { ...DEFAULT_EDITOR_SETTINGS.toolbarItems };
   editSnippets.value = DEFAULT_SQL_SNIPPETS.map((s) => ({ ...s }));
 }
@@ -802,7 +822,7 @@ function tableColumnTemplateBaseTypeForSelectedDatabase(row: TableColumnTemplate
 }
 
 function tableColumnTemplateLengthForSelectedDatabase(row: TableColumnTemplateGridRow): string {
-  return splitDataType(tableColumnTemplateDataTypeForSelectedDatabase(row)).params;
+  return dataTypeLengthInputValue(editTableColumnTemplateDatabaseType.value, tableColumnTemplateDataTypeForSelectedDatabase(row));
 }
 
 function setTableColumnTemplateDataTypeForSelectedDatabase(row: TableColumnTemplateGridRow, value: string) {
@@ -899,9 +919,8 @@ function onLocaleChange(v: any) {
   if (typeof v === "string") void setLocale(v as Locale);
 }
 
-function onRedisScanPageSizeChange(v: any) {
-  const value = Number(v);
-  if (redisScanPageSizeOptions.includes(value)) editRedisScanPageSize.value = value;
+function onUpdateDownloadSourceChange(v: any) {
+  if (v === "official" || v === "cnb") editUpdateDownloadSource.value = v;
 }
 
 function setSidebarObjectDisplay(value: "grouped" | "simple") {
@@ -996,14 +1015,13 @@ function setSidebarActivation(value: "single" | "double") {
 const activeSettingsTab = ref("editor");
 const isWeb = !isTauriRuntime();
 const displayedAppVersion = computed(() => (props.appVersion ? `v${props.appVersion}` : ""));
-type SettingsCategory = "editor" | "formatter" | "appearance" | "navigation" | "data" | "redis" | "shortcuts" | "snippets" | "sync" | "ai" | "mcp" | "security" | "about";
+type SettingsCategory = "editor" | "formatter" | "appearance" | "navigation" | "data" | "shortcuts" | "snippets" | "sync" | "ai" | "mcp" | "security" | "about";
 const settingsCategoryNav = computed<{ value: SettingsCategory; label: string }[]>(() => [
   { value: "editor", label: t("settings.editorTab") },
   { value: "formatter", label: t("settings.sqlFormatterTab") },
   { value: "appearance", label: t("settings.appearanceTab") },
   { value: "navigation", label: t("settings.navigationTab") },
   { value: "data", label: t("settings.dataTab") },
-  { value: "redis", label: t("settings.redisTab") },
   { value: "shortcuts", label: t("settings.shortcutsTab") },
   { value: "snippets", label: t("settings.snippetsTab") },
   ...(isWeb ? [] : [{ value: "sync" as const, label: t("settings.syncTab") }]),
@@ -1012,7 +1030,7 @@ const settingsCategoryNav = computed<{ value: SettingsCategory; label: string }[
   ...(isWeb ? [{ value: "security" as const, label: t("settings.securityTab") }] : []),
   { value: "about", label: t("settings.aboutTab") },
 ]);
-const settingsTabsWithApplyFooter = new Set<SettingsCategory>(["editor", "formatter", "appearance", "navigation", "data", "redis", "shortcuts", "snippets"]);
+const settingsTabsWithApplyFooter = new Set<SettingsCategory>(["editor", "formatter", "appearance", "navigation", "data", "shortcuts", "snippets"]);
 
 function hasSettingsApplyFooter(value: SettingsCategory): boolean {
   return settingsTabsWithApplyFooter.has(value);
@@ -1054,19 +1072,22 @@ async function exportDebugLogs() {
 }
 
 // ---------- MCP Server ----------
+type McpConfigTab = "claude" | "cursor" | "trae" | "vscode" | "windsurf" | "codex" | "opencode";
+type McpCopyKind = "install" | `${McpConfigTab}-config`;
+
 const mcpStatus = ref<McpServerStatus | null>(null);
 const mcpStatusLoading = ref(false);
 const mcpStatusError = ref("");
-const mcpCopied = ref<"" | "install" | "claude-config" | "codex-config">("");
-const mcpConfigTab = ref<"claude" | "codex">("claude");
+const mcpCopied = ref<"" | McpCopyKind>("");
+const mcpConfigTab = ref<McpConfigTab>("claude");
 const mcpReadonlyMode = ref(false);
 const mcpAllowDangerous = ref(false);
 const mcpInstalling = ref(false);
 const mcpInstallMessage = ref("");
 const mcpInstallError = ref(false);
 
-const mcpEnvEntries = computed(() => {
-  const entries: Array<[string, string]> = [];
+const mcpEnvEntries = computed<McpEnvEntry[]>(() => {
+  const entries: McpEnvEntry[] = [];
   if (mcpReadonlyMode.value) {
     entries.push(["DBX_MCP_ALLOW_WRITES", "0"]);
   }
@@ -1076,32 +1097,13 @@ const mcpEnvEntries = computed(() => {
   return entries;
 });
 
-const mcpClaudeRecommendedConfig = computed(() => {
-  const config: Record<string, unknown> = {
-    mcpServers: {
-      dbx: {
-        command: "dbx-mcp-server",
-      } as Record<string, unknown>,
-    },
-  };
-  if (mcpEnvEntries.value.length > 0) {
-    const env = Object.fromEntries(mcpEnvEntries.value);
-    ((config.mcpServers as Record<string, any>).dbx as Record<string, unknown>).env = env;
-  }
-  return JSON.stringify(config, null, 2);
-});
+const mcpJsonRecommendedConfig = computed(() => buildMcpJsonConfig(mcpEnvEntries.value));
 
-const mcpCodexRecommendedConfig = computed(() => {
-  const lines = ["[mcp_servers.dbx]", 'command = "dbx-mcp-server"'];
-  if (mcpEnvEntries.value.length > 0) {
-    lines.push("");
-    lines.push("[mcp_servers.dbx.env]");
-    for (const [key, value] of mcpEnvEntries.value) {
-      lines.push(`${key} = "${value}"`);
-    }
-  }
-  return lines.join("\n");
-});
+const mcpVsCodeRecommendedConfig = computed(() => buildMcpVsCodeConfig(mcpEnvEntries.value));
+
+const mcpCodexRecommendedConfig = computed(() => buildMcpCodexConfig(mcpEnvEntries.value));
+
+const mcpOpenCodeRecommendedConfig = computed(() => buildMcpOpenCodeConfig(mcpEnvEntries.value));
 
 const mcpStatusTone = computed<"ok" | "warning" | "muted">(() => {
   if (!mcpStatus.value) return "muted";
@@ -1140,7 +1142,7 @@ async function refreshMcpStatus() {
   }
 }
 
-async function copyMcpText(kind: "install" | "claude-config" | "codex-config", value: string) {
+async function copyMcpText(kind: McpCopyKind, value: string) {
   mcpCopied.value = kind;
   try {
     await copyToClipboard(value);
@@ -1183,15 +1185,14 @@ const webdavUsername = ref(localStorage.getItem("dbx-webdav-username") || "");
 const webdavPassword = ref("");
 const webdavRememberPassword = ref(localStorage.getItem("dbx-webdav-remember-password") === "true");
 const webdavHasSavedPassword = ref(false);
-const webdavRemotePath = ref(localStorage.getItem("dbx-webdav-remote-path") || "DBX/sync/snapshot.json");
+const webdavRemotePath = ref(localStorage.getItem("dbx-webdav-remote-path") || DEFAULT_WEB_DAV_REMOTE_PATH);
 const webdavSyncSecrets = ref(false);
 const webdavSecretsPassphrase = ref("");
 const webdavAutoUploadEnabled = ref(localStorage.getItem("dbx-webdav-auto-upload-enabled") === "true");
-const webdavAutoUploadIntervalMinutes = ref(Number(localStorage.getItem("dbx-webdav-auto-upload-interval-minutes") || "30"));
+const webdavAutoUploadIntervalMinutes = ref(Number(localStorage.getItem("dbx-webdav-auto-upload-interval-minutes") || String(DEFAULT_WEB_DAV_AUTO_UPLOAD_INTERVAL_MINUTES)));
 const webdavBusy = ref<"" | "test" | "upload" | "download">("");
 const webdavMessage = ref("");
 const webdavError = ref(false);
-let webdavAutoUploadTimer: ReturnType<typeof window.setInterval> | undefined;
 
 const webdavReady = computed(() => !!webdavEndpoint.value.trim() && !webdavBusy.value && (!webdavSyncSecrets.value || !!webdavSecretsPassphrase.value.trim()));
 
@@ -1200,7 +1201,7 @@ function currentWebDavConfig(): WebDavConfig {
     endpoint: webdavEndpoint.value.trim(),
     username: webdavUsername.value.trim() || undefined,
     password: webdavPassword.value || undefined,
-    remotePath: webdavRemotePath.value.trim() || "DBX/sync/snapshot.json",
+    remotePath: webdavRemotePath.value.trim() || DEFAULT_WEB_DAV_REMOTE_PATH,
   };
 }
 
@@ -1210,11 +1211,11 @@ function currentWebDavAccountConfig(): WebDavConfig {
 }
 
 function rememberWebDavFields() {
-  localStorage.setItem("dbx-webdav-endpoint", webdavEndpoint.value.trim());
-  localStorage.setItem("dbx-webdav-username", webdavUsername.value.trim());
-  localStorage.setItem("dbx-webdav-remote-path", webdavRemotePath.value.trim() || "DBX/sync/snapshot.json");
-  localStorage.setItem("dbx-webdav-auto-upload-enabled", String(webdavAutoUploadEnabled.value));
-  localStorage.setItem("dbx-webdav-auto-upload-interval-minutes", String(normalizedWebDavAutoUploadInterval()));
+  writeWebDavAutoUploadFields(currentWebDavConfig(), {
+    enabled: webdavAutoUploadEnabled.value,
+    intervalMinutes: webdavAutoUploadIntervalMinutes.value,
+  });
+  window.dispatchEvent(new Event("dbx:webdav-auto-upload-config-changed"));
 }
 
 function setWebDavResult(message: string, error = false) {
@@ -1277,43 +1278,6 @@ async function uploadWebDavSnapshot() {
     const summary = await webdavSyncUpload(currentWebDavConfig(), settingsStore.editorSettings, webdavSyncSecrets.value ? webdavSecretsPassphrase.value : undefined);
     return t("settings.syncUploadSuccess", { bytes: summary.bytes, path: summary.remotePath });
   });
-}
-
-function normalizedWebDavAutoUploadInterval() {
-  const value = Number(webdavAutoUploadIntervalMinutes.value);
-  if (!Number.isFinite(value)) return 30;
-  return Math.max(1, Math.min(1440, Math.round(value)));
-}
-
-function scheduleWebDavAutoUpload() {
-  if (webdavAutoUploadTimer) {
-    window.clearInterval(webdavAutoUploadTimer);
-    webdavAutoUploadTimer = undefined;
-  }
-  if (!webdavAutoUploadEnabled.value) return;
-
-  const intervalMinutes = normalizedWebDavAutoUploadInterval();
-  webdavAutoUploadIntervalMinutes.value = intervalMinutes;
-  webdavAutoUploadTimer = window.setInterval(() => {
-    void runWebDavAutoUpload();
-  }, intervalMinutes * 60_000);
-}
-
-async function runWebDavAutoUpload() {
-  if (!webdavEndpoint.value.trim() || webdavBusy.value) return;
-  webdavBusy.value = "upload";
-  webdavMessage.value = "";
-  webdavError.value = false;
-  try {
-    rememberWebDavFields();
-    await applyWebDavPasswordPreference();
-    const summary = await webdavSyncUpload(currentWebDavConfig(), settingsStore.editorSettings, webdavSyncSecrets.value ? webdavSecretsPassphrase.value : undefined);
-    setWebDavResult(t("settings.syncAutoUploadSuccess", { bytes: summary.bytes, path: summary.remotePath }));
-  } catch (e: any) {
-    setWebDavResult(e?.message || String(e), true);
-  } finally {
-    webdavBusy.value = "";
-  }
 }
 
 async function downloadWebDavSnapshot() {
@@ -1395,8 +1359,8 @@ watch(webdavRememberPassword, (val) => {
   localStorage.setItem("dbx-webdav-remember-password", String(val));
 });
 watch([webdavAutoUploadEnabled, webdavAutoUploadIntervalMinutes], () => {
+  webdavAutoUploadIntervalMinutes.value = normalizedWebDavAutoUploadInterval(webdavAutoUploadIntervalMinutes.value);
   rememberWebDavFields();
-  scheduleWebDavAutoUpload();
 });
 
 watch(activeSettingsTab, (tab) => {
@@ -1410,17 +1374,12 @@ watch(activeSettingsTab, (tab) => {
 
 onMounted(() => {
   void refreshWebDavPasswordStatus();
-  scheduleWebDavAutoUpload();
   checkLayoutDescTruncation();
   checkIconThemeDescTruncation();
   initTruncationObservers();
 });
 
 onUnmounted(() => {
-  if (webdavAutoUploadTimer) {
-    window.clearInterval(webdavAutoUploadTimer);
-    webdavAutoUploadTimer = undefined;
-  }
   cleanupTableColumnTemplatePointerDrag();
   cleanupTruncationObservers();
 });
@@ -1434,7 +1393,7 @@ async function changePassword() {
   changingPassword.value = true;
   passwordMessage.value = "";
   try {
-    const res = await fetch("/api/auth/change-password", {
+    const res = await fetch(apiUrl("/api/auth/change-password"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ old_password: oldPassword.value, new_password: newPassword.value }),
@@ -1476,6 +1435,7 @@ const aiEditEnableThinking = ref(settingsStore.aiConfig.enableThinking ?? true);
 const aiEditReasoningLevel = ref<AiReasoningLevel>(settingsStore.aiConfig.reasoningLevel || "default");
 const aiEditContextWindow = ref<number | undefined>(settingsStore.aiConfig.contextWindow);
 const aiEditCodexCliPath = ref(settingsStore.aiConfig.codexCliPath || "");
+const aiEditCodexCliEnvRows = ref<AiEnvRow[]>(aiEnvRowsFromConfig(settingsStore.aiConfig.codexCliEnv));
 
 const aiModelOptions = ref<AiModelInfo[]>([]);
 const aiModelLoading = ref(false);
@@ -1484,6 +1444,7 @@ const aiModelLoadedSignature = ref("");
 let aiModelRequestToken = 0;
 
 const aiCompletionsMode = computed(() => aiEditApiStyle.value === "completions");
+const aiAnthropicMessagesMode = computed(() => aiEditApiStyle.value === "anthropic-messages");
 const aiReasoningLevelOptions: Array<{ value: AiReasoningLevel; labelKey: string }> = [
   { value: "default", labelKey: "ai.reasoningLevelDefault" },
   { value: "minimal", labelKey: "ai.reasoningLevelMinimal" },
@@ -1502,7 +1463,7 @@ watch(aiIsCodexCli, (isCodex) => {
   if (isCodex) void ensureCodexMcpStatus();
 });
 const aiRequiresApiKey = computed(() => AI_PROVIDER_PRESETS[aiEditProvider.value].requiresApiKey);
-const aiSupportsAuthMethod = computed(() => aiEditProvider.value === "claude");
+const aiSupportsAuthMethod = computed(() => aiEditProvider.value === "claude" || (aiEditProvider.value === "custom" && aiAnthropicMessagesMode.value));
 const aiCredentialLabel = computed(() => (aiSupportsAuthMethod.value && aiEditAuthMethod.value === "bearer" ? "Auth Token" : "API Key"));
 const aiCredentialPlaceholder = computed(() => {
   if (!aiRequiresApiKey.value) return "Optional";
@@ -1510,18 +1471,25 @@ const aiCredentialPlaceholder = computed(() => {
   return "";
 });
 const aiEndpointPlaceholder = computed(() => {
+  if (aiEditProvider.value === "custom" && aiAnthropicMessagesMode.value) {
+    return "https://api.example.com/v1/messages";
+  }
   if (aiEditProvider.value === "openai-compatible" || aiEditProvider.value === "custom") {
     return "https://api.example.com/v1";
   }
   return "https://api.openai.com/v1";
 });
 const aiEndpointHint = computed(() => {
+  if (aiEditProvider.value === "custom" && aiAnthropicMessagesMode.value) {
+    return t("ai.anthropicMessagesHint");
+  }
   if (aiEditProvider.value === "openai-compatible" || aiEditProvider.value === "custom") {
     return "大多数 OpenAI 兼容 API 需要 /v1 路径前缀";
   }
   return "";
 });
 const aiSupportsApiStyle = computed(() => !aiIsCodexCli.value && (aiEditProvider.value === "openai" || aiEditProvider.value === "openai-compatible" || aiEditProvider.value === "custom"));
+const aiSupportsAnthropicApiStyle = computed(() => aiEditProvider.value === "custom");
 const aiCodexMcpNeedsInstall = computed(() => aiIsCodexCli.value && (!mcpStatus.value || !mcpStatus.value.installed));
 const aiCodexMcpCanInstall = computed(() => {
   const status = mcpStatus.value;
@@ -1540,6 +1508,52 @@ const aiModelEmptyText = computed(() => {
   if (!aiModelListSupported.value) return t("ai.modelListUnsupported");
   return t("ai.noModels");
 });
+const aiCodexEnvError = computed(() => codexEnvValidationError());
+const aiCodexPathError = computed(() => {
+  const path = aiEditCodexCliPath.value.trim();
+  const firstToken = path.split(/\s+/)[0] || "";
+  return /^[A-Za-z_][A-Za-z0-9_]*=/.test(firstToken) ? t("ai.codexCliPathEnvError") : "";
+});
+const aiCodexValidationError = computed(() => (aiIsCodexCli.value ? aiCodexPathError.value || aiCodexEnvError.value : ""));
+
+function aiEnvRowsFromConfig(env: unknown): AiEnvRow[] {
+  return Object.entries(normalizeAiEnv(env)).map(([key, value]) => ({ id: uuid(), key, value }));
+}
+
+function codexEnvFromRows(): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const row of aiEditCodexCliEnvRows.value) {
+    const key = row.key.trim();
+    if (!key || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || key.toUpperCase().startsWith("DBX_MCP_")) continue;
+    result[key] = row.value;
+  }
+  return result;
+}
+
+function codexEnvSignature(): string {
+  return JSON.stringify(Object.entries(codexEnvFromRows()).sort(([left], [right]) => left.localeCompare(right)));
+}
+
+function savedCodexEnvSignature(): string {
+  return JSON.stringify(Object.entries(normalizeAiEnv(settingsStore.aiConfig.codexCliEnv)).sort(([left], [right]) => left.localeCompare(right)));
+}
+
+function codexEnvValidationError(): string {
+  for (const row of aiEditCodexCliEnvRows.value) {
+    const key = row.key.trim();
+    if (key && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) return t("ai.codexCliEnvInvalidName", { name: key });
+    if (key.toUpperCase().startsWith("DBX_MCP_")) return t("ai.codexCliEnvReservedName", { name: key });
+  }
+  return "";
+}
+
+function addCodexEnvRow() {
+  aiEditCodexCliEnvRows.value.push({ id: uuid(), key: "", value: "" });
+}
+
+function removeCodexEnvRow(id: string) {
+  aiEditCodexCliEnvRows.value = aiEditCodexCliEnvRows.value.filter((row) => row.id !== id);
+}
 
 function clearAiModelOptions() {
   aiModelRequestToken += 1;
@@ -1558,6 +1572,7 @@ function aiModelConfigSignature() {
     proxyEnabled: aiEditProxyEnabled.value,
     proxyUrl: aiEditProxyUrl.value.trim(),
     codexCliPath: aiEditCodexCliPath.value.trim(),
+    codexCliEnv: codexEnvSignature(),
   });
 }
 
@@ -1575,6 +1590,7 @@ function currentAiEditConfig() {
     reasoningLevel: aiEditReasoningLevel.value,
     contextWindow: aiEditContextWindow.value || undefined,
     codexCliPath: aiEditCodexCliPath.value.trim() || undefined,
+    codexCliEnv: aiIsCodexCli.value ? codexEnvFromRows() : {},
   };
 }
 
@@ -1592,6 +1608,14 @@ function normalizeAiModelOptions(models: AiModelInfo[]): AiModelInfo[] {
 
 function displayAiModelName(modelId: string): string {
   return aiModelOptions.value.find((model) => model.id === modelId)?.displayName || modelId;
+}
+
+function aiModelOptionPresentation(modelId: string, label = displayAiModelName(modelId)) {
+  return formatAiModelOption(label, modelId);
+}
+
+function aiModelOptionSecondary(modelId: string, label = displayAiModelName(modelId)) {
+  return aiModelOptionPresentation(modelId, label).secondary;
 }
 
 async function aiRefreshModels() {
@@ -1652,6 +1676,7 @@ function syncAiEditState() {
   aiEditReasoningLevel.value = settingsStore.aiConfig.reasoningLevel || "default";
   aiEditContextWindow.value = settingsStore.aiConfig.contextWindow;
   aiEditCodexCliPath.value = settingsStore.aiConfig.codexCliPath || "";
+  aiEditCodexCliEnvRows.value = aiEnvRowsFromConfig(settingsStore.aiConfig.codexCliEnv);
   aiTestResult.value = "";
   aiTestError.value = "";
   aiTestLatency.value = null;
@@ -1669,12 +1694,20 @@ function aiSelectProvider(provider: AiProvider) {
   aiEditReasoningLevel.value = "default";
   if (!AI_PROVIDER_PRESETS[provider].requiresApiKey) aiEditApiKey.value = "";
   aiEditCodexCliPath.value = "";
+  aiEditCodexCliEnvRows.value = [];
   aiTestResult.value = "";
   aiTestError.value = "";
   aiTestLatency.value = null;
   aiTestErrorCopied.value = false;
   clearAiModelOptions();
   if (provider === "codex-cli") void ensureCodexMcpStatus();
+}
+
+function aiSelectApiStyle(style: AiApiStyle) {
+  aiEditApiStyle.value = style;
+  if (aiEditProvider.value === "custom") {
+    aiEditAuthMethod.value = style === "anthropic-messages" ? "api-key" : "bearer";
+  }
 }
 
 function aiHasChanges(): boolean {
@@ -1690,16 +1723,27 @@ function aiHasChanges(): boolean {
     aiEditEnableThinking.value !== (settingsStore.aiConfig.enableThinking ?? true) ||
     aiEditReasoningLevel.value !== (settingsStore.aiConfig.reasoningLevel || "default") ||
     aiEditContextWindow.value !== settingsStore.aiConfig.contextWindow ||
-    aiEditCodexCliPath.value !== (settingsStore.aiConfig.codexCliPath || "")
+    aiEditCodexCliPath.value !== (settingsStore.aiConfig.codexCliPath || "") ||
+    codexEnvSignature() !== savedCodexEnvSignature()
   );
 }
 
 function aiApplySettings() {
+  if (aiCodexValidationError.value) {
+    aiTestResult.value = "error";
+    aiTestError.value = aiCodexValidationError.value;
+    return;
+  }
   settingsStore.updateAiConfig(currentAiEditConfig());
 }
 
 async function aiTestConn() {
   if ((aiRequiresApiKey.value && !aiEditApiKey.value.trim()) || (!aiIsCodexCli.value && !aiEditEndpoint.value.trim()) || (!aiIsCodexCli.value && !aiEditModel.value.trim())) return;
+  if (aiCodexValidationError.value) {
+    aiTestResult.value = "error";
+    aiTestError.value = aiCodexValidationError.value;
+    return;
+  }
   aiTesting.value = true;
   aiTestResult.value = "";
   aiTestError.value = "";
@@ -2001,7 +2045,7 @@ watch(
                           readonly
                           :aria-invalid="shortcutConflicts.includes(definition.id)"
                           :placeholder="t('settings.shortcutPressShortcut')"
-                          class="h-7 w-auto min-w-12 max-w-32 shrink-0 cursor-default rounded-full border border-transparent bg-background px-2.5 text-center font-mono text-[13px] font-semibold text-foreground/75 shadow-inner outline-none selection:bg-transparent placeholder:text-muted-foreground aria-invalid:border-destructive/70 aria-invalid:text-destructive aria-invalid:ring-destructive/20"
+                          class="h-7 w-auto min-w-12 max-w-32 shrink-0 cursor-default rounded-[6px] border border-transparent bg-background px-2.5 text-center font-mono text-[13px] font-semibold text-foreground/75 shadow-inner outline-none selection:bg-transparent placeholder:text-muted-foreground aria-invalid:border-destructive/70 aria-invalid:text-destructive aria-invalid:ring-destructive/20"
                           :class="editingShortcutId === definition.id ? 'max-w-44 cursor-text border-border/80 bg-background text-left text-foreground shadow-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/35' : ''"
                           @keydown="(event: KeyboardEvent) => onShortcutKeydown(definition.id, event)"
                         />
@@ -2108,11 +2152,11 @@ watch(
                     }
                   "
                 >
-                  <SelectTrigger class="w-40">
+                  <SelectTrigger class="min-w-36">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem v-for="scale in uiScaleOptions" :key="scale" :value="String(scale)"> {{ Math.round(scale * 100) }}% </SelectItem>
+                    <SelectItem v-for="scale in uiScaleOptions" :key="scale" :value="String(scale)" class="pl-2.5"> {{ Math.round(scale * 100) }}% </SelectItem>
                   </SelectContent>
                 </Select>
                 <p class="text-xs text-muted-foreground">{{ t("settings.uiScaleDescription") }}</p>
@@ -2284,6 +2328,17 @@ watch(
                     </p>
                   </div>
                   <Switch id="compact-column-header-actions" v-model="editCompactColumnHeaderActions" />
+                </div>
+                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
+                    <Label for="data-grid-quick-entry">
+                      {{ t("settings.dataGridQuickEntry") }}
+                    </Label>
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("settings.dataGridQuickEntryDescription") }}
+                    </p>
+                  </div>
+                  <Switch id="data-grid-quick-entry" v-model="editDataGridQuickEntry" />
                 </div>
                 <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
@@ -2648,23 +2703,6 @@ watch(
               </div>
             </section>
 
-            <section v-else-if="activeSettingsTab === 'redis'" class="flex flex-col gap-5 py-2">
-              <div class="space-y-2">
-                <Label>{{ t("settings.redisScanPageSize") }}</Label>
-                <Select :model-value="String(editRedisScanPageSize)" @update:model-value="onRedisScanPageSizeChange">
-                  <SelectTrigger>
-                    <SelectValue :placeholder="t('settings.redisScanPageSize')" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem v-for="size in redisScanPageSizeOptions" :key="size" :value="String(size)">
-                      {{ t("settings.redisScanPageSizeOption", { count: size }) }}
-                    </SelectItem>
-                  </SelectContent>
-                </Select>
-                <p class="text-xs text-muted-foreground">{{ t("settings.redisScanPageSizeDescription") }}</p>
-              </div>
-            </section>
-
             <section v-else-if="activeSettingsTab === 'shortcuts'" class="flex flex-col gap-2 py-2">
               <div class="overflow-hidden rounded-md border border-border/70 bg-background">
                 <div v-for="definition in SHORTCUT_DEFINITIONS" :key="definition.id" class="group -mt-px grid gap-2 border-t border-border/70 px-3 py-2 transition-colors first:mt-0 first:border-t-0 hover:bg-muted/40 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
@@ -2687,7 +2725,7 @@ watch(
                         readonly
                         :aria-invalid="shortcutConflicts.includes(definition.id)"
                         :placeholder="t('settings.shortcutPressShortcut')"
-                        class="h-7 w-auto min-w-12 max-w-32 shrink-0 cursor-default rounded-full border border-transparent bg-muted px-2.5 text-center font-mono text-[13px] font-semibold text-foreground/75 shadow-inner outline-none selection:bg-transparent placeholder:text-muted-foreground aria-invalid:border-destructive/70 aria-invalid:text-destructive aria-invalid:ring-destructive/20"
+                        class="h-7 w-auto min-w-12 max-w-32 shrink-0 cursor-default rounded-[6px] border border-transparent bg-muted px-2.5 text-center font-mono text-[13px] font-semibold text-foreground/75 shadow-inner outline-none selection:bg-transparent placeholder:text-muted-foreground aria-invalid:border-destructive/70 aria-invalid:text-destructive aria-invalid:ring-destructive/20"
                         :class="editingShortcutId === definition.id ? 'max-w-44 cursor-text border-border/80 bg-background text-left text-foreground shadow-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/35' : ''"
                         @keydown="(event: KeyboardEvent) => onShortcutKeydown(definition.id, event)"
                       />
@@ -2966,6 +3004,28 @@ watch(
                   <div class="col-span-2 space-y-1.5">
                     <Input v-model="aiEditCodexCliPath" autocomplete="off" class="h-8 text-xs" placeholder="codex" />
                     <p class="text-[11px] text-muted-foreground">{{ t("ai.codexCliPathHint") }}</p>
+                    <p v-if="aiCodexPathError" class="text-[11px] text-destructive">{{ aiCodexPathError }}</p>
+                  </div>
+                </div>
+
+                <div v-if="aiIsCodexCli" class="grid grid-cols-3 items-start gap-3">
+                  <Label class="pt-2 text-right text-xs">{{ t("ai.codexCliEnv") }}</Label>
+                  <div class="col-span-2 space-y-2">
+                    <div class="space-y-1.5">
+                      <div v-for="row in aiEditCodexCliEnvRows" :key="row.id" class="grid grid-cols-[minmax(0,0.9fr)_minmax(0,1.3fr)_2rem] gap-2">
+                        <Input v-model="row.key" autocomplete="off" class="h-8 font-mono text-xs" :placeholder="t('ai.codexCliEnvKeyPlaceholder')" />
+                        <Input v-model="row.value" autocomplete="off" class="h-8 font-mono text-xs" :placeholder="t('ai.codexCliEnvValuePlaceholder')" />
+                        <Button type="button" variant="ghost" size="icon" class="h-8 w-8" :title="t('common.remove')" :aria-label="t('common.remove')" @click="removeCodexEnvRow(row.id)">
+                          <X class="h-3.5 w-3.5" />
+                        </Button>
+                      </div>
+                    </div>
+                    <Button type="button" variant="outline" size="sm" class="h-7 px-2 text-xs" @click="addCodexEnvRow">
+                      <Plus class="mr-1 h-3.5 w-3.5" />
+                      {{ t("ai.codexCliEnvAdd") }}
+                    </Button>
+                    <p v-if="aiCodexEnvError" class="text-[11px] text-destructive">{{ aiCodexEnvError }}</p>
+                    <p v-else class="text-[11px] text-muted-foreground">{{ t("ai.codexCliEnvHint") }}</p>
                   </div>
                 </div>
 
@@ -2985,6 +3045,7 @@ watch(
                         :display-name="displayAiModelName"
                         trigger-class="h-8 min-w-[104px] max-w-[150px] shrink-0 border border-border bg-background px-2 text-xs shadow-none hover:bg-muted/50"
                         content-class="w-72"
+                        item-class="h-auto min-h-8 py-1.5"
                         @update:model-value="aiSelectModel"
                         @update:open="onAiModelListOpen"
                       >
@@ -2992,9 +3053,9 @@ watch(
                           <span class="truncate">{{ loading ? t("ai.loadingModels") : t("ai.browseModels") }}</span>
                         </template>
                         <template #option-label="{ option, label }">
-                          <span class="flex min-w-0 flex-col">
-                            <span class="truncate">{{ label }}</span>
-                            <span v-if="label !== option" class="truncate text-[11px] text-muted-foreground">{{ option }}</span>
+                          <span class="flex min-w-0 flex-col leading-tight">
+                            <span class="truncate">{{ aiModelOptionPresentation(option, label).primary }}</span>
+                            <span v-if="aiModelOptionSecondary(option, label)" class="mt-0.5 truncate text-[11px] text-muted-foreground">{{ aiModelOptionSecondary(option, label) }}</span>
                           </span>
                         </template>
                       </SearchableSelect>
@@ -3030,8 +3091,9 @@ watch(
                 <div v-if="aiSupportsApiStyle" class="grid grid-cols-3 items-center gap-3">
                   <Label class="text-right text-xs">API</Label>
                   <div class="col-span-2 flex gap-2">
-                    <Button size="sm" variant="outline" class="h-8 flex-1 text-xs" :class="{ 'border-blue-300 border-2 ring-2 ring-blue-300/50': aiEditApiStyle === 'completions' }" @click="aiEditApiStyle = 'completions'">/chat/completions</Button>
-                    <Button size="sm" variant="outline" class="h-8 flex-1 text-xs" :class="{ 'border-blue-300 border-2 ring-2 ring-blue-300/50': aiEditApiStyle === 'responses' }" @click="aiEditApiStyle = 'responses'">/responses</Button>
+                    <Button size="sm" variant="outline" class="h-8 flex-1 text-xs" :class="{ 'border-blue-300 border-2 ring-2 ring-blue-300/50': aiEditApiStyle === 'completions' }" @click="aiSelectApiStyle('completions')">/chat/completions</Button>
+                    <Button size="sm" variant="outline" class="h-8 flex-1 text-xs" :class="{ 'border-blue-300 border-2 ring-2 ring-blue-300/50': aiEditApiStyle === 'responses' }" @click="aiSelectApiStyle('responses')">/responses</Button>
+                    <Button v-if="aiSupportsAnthropicApiStyle" size="sm" variant="outline" class="h-8 flex-1 text-xs" :class="{ 'border-blue-300 border-2 ring-2 ring-blue-300/50': aiEditApiStyle === 'anthropic-messages' }" @click="aiSelectApiStyle('anthropic-messages')">/messages</Button>
                   </div>
                 </div>
 
@@ -3178,18 +3240,83 @@ watch(
               <div class="space-y-2">
                 <Label>{{ t("settings.mcpConfig") }}</Label>
                 <Tabs v-model="mcpConfigTab" class="space-y-3">
-                  <TabsList>
+                  <TabsList class="max-w-full overflow-x-auto">
                     <TabsTrigger value="claude">Claude Code</TabsTrigger>
+                    <TabsTrigger value="cursor">Cursor</TabsTrigger>
+                    <TabsTrigger value="trae">TRAE</TabsTrigger>
+                    <TabsTrigger value="vscode">VS Code</TabsTrigger>
+                    <TabsTrigger value="windsurf">Windsurf</TabsTrigger>
                     <TabsTrigger value="codex">Codex</TabsTrigger>
+                    <TabsTrigger value="opencode">OpenCode</TabsTrigger>
                   </TabsList>
 
                   <TabsContent value="claude" class="m-0">
                     <div class="relative rounded-md border bg-background p-3">
-                      <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpClaudeRecommendedConfig }}</code></pre>
-                      <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('claude-config', mcpClaudeRecommendedConfig)">
+                      <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpJsonRecommendedConfig }}</code></pre>
+                      <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('claude-config', mcpJsonRecommendedConfig)">
                         <CheckCircle2 v-if="mcpCopied === 'claude-config'" class="h-3.5 w-3.5 text-green-500" />
                         <Copy v-else class="h-3.5 w-3.5" />
                       </Button>
+                    </div>
+                  </TabsContent>
+
+                  <TabsContent value="cursor" class="m-0">
+                    <div class="space-y-2">
+                      <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                        {{ t("settings.mcpCursorConfigPath") }}
+                      </div>
+                      <div class="relative rounded-md border bg-background p-3">
+                        <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpJsonRecommendedConfig }}</code></pre>
+                        <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('cursor-config', mcpJsonRecommendedConfig)">
+                          <CheckCircle2 v-if="mcpCopied === 'cursor-config'" class="h-3.5 w-3.5 text-green-500" />
+                          <Copy v-else class="h-3.5 w-3.5" />
+                        </Button>
+                      </div>
+                    </div>
+                  </TabsContent>
+
+                  <TabsContent value="trae" class="m-0">
+                    <div class="space-y-2">
+                      <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                        {{ t("settings.mcpTraeConfigPath") }}
+                      </div>
+                      <div class="relative rounded-md border bg-background p-3">
+                        <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpJsonRecommendedConfig }}</code></pre>
+                        <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('trae-config', mcpJsonRecommendedConfig)">
+                          <CheckCircle2 v-if="mcpCopied === 'trae-config'" class="h-3.5 w-3.5 text-green-500" />
+                          <Copy v-else class="h-3.5 w-3.5" />
+                        </Button>
+                      </div>
+                    </div>
+                  </TabsContent>
+
+                  <TabsContent value="vscode" class="m-0">
+                    <div class="space-y-2">
+                      <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                        {{ t("settings.mcpVsCodeConfigPath") }}
+                      </div>
+                      <div class="relative rounded-md border bg-background p-3">
+                        <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpVsCodeRecommendedConfig }}</code></pre>
+                        <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('vscode-config', mcpVsCodeRecommendedConfig)">
+                          <CheckCircle2 v-if="mcpCopied === 'vscode-config'" class="h-3.5 w-3.5 text-green-500" />
+                          <Copy v-else class="h-3.5 w-3.5" />
+                        </Button>
+                      </div>
+                    </div>
+                  </TabsContent>
+
+                  <TabsContent value="windsurf" class="m-0">
+                    <div class="space-y-2">
+                      <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                        {{ t("settings.mcpWindsurfConfigPath") }}
+                      </div>
+                      <div class="relative rounded-md border bg-background p-3">
+                        <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpJsonRecommendedConfig }}</code></pre>
+                        <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('windsurf-config', mcpJsonRecommendedConfig)">
+                          <CheckCircle2 v-if="mcpCopied === 'windsurf-config'" class="h-3.5 w-3.5 text-green-500" />
+                          <Copy v-else class="h-3.5 w-3.5" />
+                        </Button>
+                      </div>
                     </div>
                   </TabsContent>
 
@@ -3202,6 +3329,21 @@ watch(
                         <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpCodexRecommendedConfig }}</code></pre>
                         <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('codex-config', mcpCodexRecommendedConfig)">
                           <CheckCircle2 v-if="mcpCopied === 'codex-config'" class="h-3.5 w-3.5 text-green-500" />
+                          <Copy v-else class="h-3.5 w-3.5" />
+                        </Button>
+                      </div>
+                    </div>
+                  </TabsContent>
+
+                  <TabsContent value="opencode" class="m-0">
+                    <div class="space-y-2">
+                      <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                        {{ t("settings.mcpOpenCodeConfigPath") }}
+                      </div>
+                      <div class="relative rounded-md border bg-background p-3">
+                        <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpOpenCodeRecommendedConfig }}</code></pre>
+                        <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('opencode-config', mcpOpenCodeRecommendedConfig)">
+                          <CheckCircle2 v-if="mcpCopied === 'opencode-config'" class="h-3.5 w-3.5 text-green-500" />
                           <Copy v-else class="h-3.5 w-3.5" />
                         </Button>
                       </div>
@@ -3243,6 +3385,24 @@ watch(
                   <div v-if="displayedAppVersion" class="rounded-md border bg-background px-2 py-1 text-xs text-muted-foreground">
                     {{ displayedAppVersion }}
                   </div>
+                </div>
+              </div>
+
+              <div class="rounded-lg border p-4">
+                <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div class="min-w-0 space-y-1">
+                    <Label>{{ t("settings.updateDownloadSource") }}</Label>
+                    <p class="text-sm text-muted-foreground">{{ t("settings.updateDownloadSourceDescription") }}</p>
+                  </div>
+                  <Select :model-value="editUpdateDownloadSource" @update:model-value="onUpdateDownloadSourceChange">
+                    <SelectTrigger class="h-9 w-full sm:w-[180px]">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="official">{{ t("settings.updateDownloadSourceOfficial") }}</SelectItem>
+                      <SelectItem value="cnb">{{ t("settings.updateDownloadSourceCnb") }}</SelectItem>
+                    </SelectContent>
+                  </Select>
                 </div>
               </div>
 
@@ -3334,7 +3494,7 @@ watch(
 
           <DialogFooter v-else-if="activeSettingsTab === 'ai'" class="mx-0 mb-0 flex-row flex-wrap items-center justify-end gap-2 rounded-none border-t border-border/60 bg-transparent px-0 pb-0 pt-3 sm:flex-row sm:gap-2 [&>button]:w-auto [&>button]:shrink-0">
             <div class="flex flex-1 items-center gap-2">
-              <Button size="sm" variant="outline" :disabled="aiTesting || (aiRequiresApiKey && !aiEditApiKey?.trim()) || (!aiIsCodexCli && !aiEditEndpoint?.trim()) || (!aiIsCodexCli && !aiEditModel?.trim())" @click="aiTestConn">
+              <Button size="sm" variant="outline" :disabled="aiTesting || !!aiCodexValidationError || (aiRequiresApiKey && !aiEditApiKey?.trim()) || (!aiIsCodexCli && !aiEditEndpoint?.trim()) || (!aiIsCodexCli && !aiEditModel?.trim())" @click="aiTestConn">
                 <Loader2 v-if="aiTesting" class="h-3 w-3 animate-spin mr-1" />
                 {{ t("connection.test") }}
               </Button>
@@ -3359,7 +3519,7 @@ watch(
               </span>
             </div>
             <Button variant="outline" @click="emit('update:open', false)">{{ t("common.close") }}</Button>
-            <Button :disabled="!aiHasChanges()" @click="aiApplySettings">{{ t("settings.apply") }}</Button>
+            <Button :disabled="!aiHasChanges() || !!aiCodexValidationError" @click="aiApplySettings">{{ t("settings.apply") }}</Button>
           </DialogFooter>
 
           <DialogFooter v-else-if="activeSettingsTab === 'sync'" class="mx-0 mb-0 flex-row flex-wrap items-center justify-end gap-2 rounded-none border-t border-border/60 bg-transparent px-0 pb-0 pt-3 sm:flex-row sm:gap-2 [&>button]:w-auto [&>button]:shrink-0">
@@ -3418,6 +3578,12 @@ watch(
             <div class="flex-1" />
             <Button variant="outline" @click="emit('update:open', false)">
               {{ t("common.close") }}
+            </Button>
+            <Button :disabled="!hasChanges() || hasApplyBlocker" @click="applySettings">
+              {{ t("settings.apply") }}
+            </Button>
+            <Button :disabled="!hasChanges() || hasApplyBlocker" @click="applySettingsAndClose">
+              {{ t("settings.applyAndClose") }}
             </Button>
           </DialogFooter>
         </div>

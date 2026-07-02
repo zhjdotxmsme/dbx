@@ -10,8 +10,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  RUSTFLAGS: -C debuginfo=line-tables-only
+
 jobs:
   frontend:
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
@@ -42,7 +47,9 @@ jobs:
       - name: Node package publish dry run
         run: pnpm publish:dry-run
 
-  rust:
+  rust-fmt-clippy:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
@@ -61,13 +68,13 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
           workspaces: "./ -> target"
-          shared-key: ci-x86_64-unknown-linux-gnu
+          shared-key: ci-rust-fmt-clippy-x86_64-unknown-linux-gnu
 
       - name: Cargo fmt check
         run: cargo fmt --check
@@ -75,10 +82,55 @@ jobs:
       - name: Cargo clippy
         run: cargo clippy --workspace --locked --all-targets
 
+  rust-test:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/.ghcup || true
+          docker system prune -af || true
+          df -h
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libsecret-1-dev
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./ -> target"
+          shared-key: ci-rust-test-x86_64-unknown-linux-gnu
+
       - name: Cargo test
         run: cargo test --workspace --locked
 
+  rust:
+    needs: [changes, rust-fmt-clippy, rust-test]
+    if: always() && needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check Rust jobs
+        run: |
+          if [ "${{ needs.rust-fmt-clippy.result }}" != "success" ]; then
+            echo "rust-fmt-clippy result: ${{ needs.rust-fmt-clippy.result }}"
+            exit 1
+          fi
+          if [ "${{ needs.rust-test.result }}" != "success" ]; then
+            echo "rust-test result: ${{ needs.rust-test.result }}"
+            exit 1
+          fi
+
   jdbc:
+    needs: changes
+    if: needs.changes.outputs.jdbc == 'true'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
@@ -107,31 +159,39 @@ jobs:
   changes:
     runs-on: ubuntu-22.04
     outputs:
+      frontend: ${{ steps.filter.outputs.frontend }}
+      rust: ${{ steps.filter.outputs.rust }}
+      jdbc: ${{ steps.filter.outputs.jdbc }}
       agents: ${{ steps.filter.outputs.agents }}
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
-      - name: Detect agent changes
+      - name: Detect changed areas
+        uses: dorny/paths-filter@v3
         id: filter
-        shell: bash
-        env:
-          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-        run: |
-          if [ -z "$BASE_SHA" ] || echo "$BASE_SHA" | grep -Eq '^0+$' || ! git rev-parse --verify "$BASE_SHA^{commit}" >/dev/null 2>&1; then
-            if git rev-parse --verify HEAD^ >/dev/null 2>&1; then
-              BASE_SHA="HEAD^"
-            else
-              BASE_SHA="$(git hash-object -t tree /dev/null)"
-            fi
-          fi
-
-          if git diff --name-only "$BASE_SHA" HEAD -- agents/ | grep -q .; then
-            echo "agents=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "agents=false" >> "$GITHUB_OUTPUT"
-          fi
+        with:
+          filters: |
+            frontend:
+              - 'apps/desktop/**'
+              - 'packages/**'
+              - 'pnpm-lock.yaml'
+              - 'package.json'
+              - '.oxfmtrc.json'
+              - 'scripts/run-check.mjs'
+              - '.github/workflows/ci.yml'
+            rust:
+              - 'crates/**'
+              - 'src-tauri/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain*'
+              - '.github/workflows/ci.yml'
+            jdbc:
+              - 'plugins/jdbc/**'
+            agents:
+              - 'agents/**'
 
   agents:
     needs: changes

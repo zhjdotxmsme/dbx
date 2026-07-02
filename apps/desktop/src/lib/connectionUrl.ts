@@ -1,6 +1,8 @@
 import type { ConnectionConfig, DatabaseType } from "@/types/database";
+import { h2JdbcUrlHasPasswordParam, h2JdbcUrlHasUserParam, parseH2JdbcUrl } from "@/lib/h2Connection";
 
 export interface ParsedConnectionUrl {
+  name?: string;
   dbType: DatabaseType;
   driverProfile: string;
   driverLabel: string;
@@ -43,6 +45,7 @@ const SCHEME_PROFILES: Record<string, ConnectionProfile> = {
   qdrant: { type: "qdrant", profile: "qdrant", label: "Qdrant", defaultPort: 6333 },
   milvus: { type: "milvus", profile: "milvus", label: "Milvus", defaultPort: 19530 },
   weaviate: { type: "weaviate", profile: "weaviate", label: "Weaviate", defaultPort: 8080 },
+  chromadb: { type: "chromadb", profile: "chromadb", label: "ChromaDB", defaultPort: 8000 },
   dm: { type: "dameng", profile: "dm", label: "DM (Dameng)", defaultPort: 5236 },
   dameng: { type: "dameng", profile: "dm", label: "DM (Dameng)", defaultPort: 5236 },
   gaussdb: { type: "gaussdb", profile: "gaussdb", label: "GaussDB", defaultPort: 5432 },
@@ -66,6 +69,7 @@ const HTTP_SELECTED_PROFILES: Record<string, ConnectionProfile> = {
   qdrant: SCHEME_PROFILES.qdrant,
   milvus: SCHEME_PROFILES.milvus,
   weaviate: SCHEME_PROFILES.weaviate,
+  chromadb: SCHEME_PROFILES.chromadb,
 };
 
 function decodeUrlPart(value: string): string {
@@ -168,6 +172,28 @@ function queryParamValue(params: string, key: string): string | undefined {
     }
   }
   return undefined;
+}
+
+function connectionNameParam(parsed: URL): string | undefined {
+  for (const [key, value] of parsed.searchParams) {
+    if (key.toLowerCase() === "name") {
+      const name = value.trim();
+      if (name) return name;
+    }
+  }
+  return undefined;
+}
+
+function stripConnectionNameParam(params: string): string {
+  if (!params) return params;
+  return params
+    .split("&")
+    .filter((part) => {
+      if (!part) return true;
+      const [rawKey] = part.split("=");
+      return decodeUrlPart(rawKey).trim().toLowerCase() !== "name";
+    })
+    .join("&");
 }
 
 function extractMysqlCredentialParams(params: string): { username?: string; password?: string; urlParams: string } {
@@ -393,17 +419,84 @@ function parseJdbcInformixUrl(source: string): ParsedConnectionUrl | null {
   };
 }
 
+function parseJdbcDremioUrl(source: string): ParsedConnectionUrl | null {
+  const match = /^jdbc:dremio:(?<mode>direct|zk)=(?<host>\[[^\]]+\]|[^:;]+)(?::(?<port>\d+))?(?:;(?<params>.*))?$/i.exec(source);
+  if (!match?.groups) return null;
+
+  const props = new Map<string, string>();
+  const urlParams: string[] = [];
+  for (const part of (match.groups.params || "").split(";")) {
+    if (!part) continue;
+    const [rawKey, ...rest] = part.split("=");
+    const key = rawKey.trim();
+    const value = rest.join("=");
+    const normalizedKey = key.toLowerCase();
+    if (normalizedKey === "schema" || normalizedKey === "user" || normalizedKey === "password") {
+      props.set(normalizedKey, value);
+    } else {
+      urlParams.push(part);
+    }
+  }
+
+  return {
+    dbType: "jdbc",
+    driverProfile: "dremio",
+    driverLabel: "Dremio",
+    host: match.groups.host.replace(/^\[/, "").replace(/\]$/, ""),
+    port: match.groups.port ? Number(match.groups.port) : match.groups.mode.toLowerCase() === "zk" ? 2181 : 31010,
+    username: decodeUrlPart(props.get("user") || ""),
+    password: decodeUrlPart(props.get("password") || ""),
+    database: decodeUrlPart(props.get("schema") || "") || undefined,
+    urlParams: urlParams.join(";"),
+    ssl: false,
+    connectionString: source,
+  };
+}
+
+function parseJdbcDremioArrowFlightSqlUrl(source: string): ParsedConnectionUrl | null {
+  if (!/^jdbc:arrow-flight-sql:\/\//i.test(source)) return null;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(source.replace(/^jdbc:/i, ""));
+  } catch {
+    return null;
+  }
+
+  const urlParams = parsed.search.replace(/^\?/, "");
+
+  return {
+    dbType: "jdbc",
+    driverProfile: "dremio",
+    driverLabel: "Dremio",
+    host: parsed.hostname.replace(/^\[(.*)]$/, "$1"),
+    port: parsed.port ? Number(parsed.port) : 32010,
+    username: decodeUrlPart(parsed.username),
+    password: decodeUrlPart(parsed.password),
+    database: queryParamValue(urlParams, "schema") || undefined,
+    urlParams,
+    ssl: queryParamValue(urlParams, "useEncryption")?.toLowerCase() !== "false",
+    connectionString: source,
+  };
+}
+
 export function parseConnectionUrl(value: string, preferredProfile?: string): ParsedConnectionUrl {
   const input = value.trim();
   if (!input) {
     throw new Error("Connection URL is empty");
   }
+  const jdbcH2 = parseH2JdbcUrl(input);
+  if (jdbcH2) return jdbcH2;
   const jdbcUCanAccess = parseJdbcUCanAccessUrl(input);
   if (jdbcUCanAccess) return jdbcUCanAccess;
   const jdbcGbase8s = parseJdbcGbase8sUrl(input);
   if (jdbcGbase8s) return jdbcGbase8s;
   const jdbcInformix = parseJdbcInformixUrl(input);
   if (jdbcInformix) return jdbcInformix;
+  const jdbcDremioArrowFlightSql = parseJdbcDremioArrowFlightSqlUrl(input);
+  if (jdbcDremioArrowFlightSql) return jdbcDremioArrowFlightSql;
+  const jdbcDremio = parseJdbcDremioUrl(input);
+  if (jdbcDremio) return jdbcDremio;
   const jdbcOracle = parseJdbcOracleUrl(input);
   if (jdbcOracle) return jdbcOracle;
   const jdbcSqlServer = parseJdbcSqlServerUrl(input);
@@ -428,8 +521,10 @@ export function parseConnectionUrl(value: string, preferredProfile?: string): Pa
   }
 
   const urlParams = parsed.search.replace(/^\?/, "");
+  const name = connectionNameParam(parsed);
+  const urlParamsWithoutName = stripConnectionNameParam(urlParams);
   const normalizedFragment = decodeUrlPart(parsed.hash.replace(/^#/, "")).trim().toLowerCase();
-  const parsedUrlParams = profile.type === "redis" && normalizedFragment === "insecure" ? [urlParams, "insecure=true"].filter(Boolean).join("&") : urlParams;
+  const parsedUrlParams = profile.type === "redis" && normalizedFragment === "insecure" ? [urlParamsWithoutName, "insecure=true"].filter(Boolean).join("&") : urlParamsWithoutName;
   const mysqlCredentials = isJdbcUrl && profile.type === "mysql" ? extractMysqlCredentialParams(parsedUrlParams) : undefined;
   const effectiveUrlParams = mysqlCredentials?.urlParams ?? parsedUrlParams;
   if (profile.type === "mongodb") {
@@ -450,6 +545,7 @@ export function parseConnectionUrl(value: string, preferredProfile?: string): Pa
   }
   if (profile.type === "zookeeper") {
     return {
+      ...(name ? { name } : {}),
       dbType: profile.type,
       driverProfile: profile.profile,
       driverLabel: profile.label,
@@ -458,13 +554,14 @@ export function parseConnectionUrl(value: string, preferredProfile?: string): Pa
       username: decodeUrlPart(parsed.username),
       password: decodeUrlPart(parsed.password),
       database: undefined,
-      urlParams,
+      urlParams: urlParamsWithoutName,
       ssl: false,
       connectionString: zookeeperConnectStringFromUrl(parsed, profile.defaultPort),
     };
   }
 
   return {
+    ...(name ? { name } : {}),
     dbType: profile.type,
     driverProfile: profile.profile,
     driverLabel: profile.label,
@@ -486,6 +583,20 @@ function zookeeperConnectStringFromUrl(parsed: URL, defaultPort: number): string
   return `${host}:${port}${chroot}`;
 }
 
+function applyParsedUsername(config: Omit<ConnectionConfig, "id">, parsed: ParsedConnectionUrl): string {
+  if (parsed.dbType === "h2" && config.db_type === "h2" && !h2JdbcUrlHasUserParam(parsed.connectionString)) {
+    return config.username || parsed.username;
+  }
+  return parsed.username;
+}
+
+function applyParsedPassword(config: Omit<ConnectionConfig, "id">, parsed: ParsedConnectionUrl): string {
+  if (parsed.dbType === "h2" && config.db_type === "h2" && !h2JdbcUrlHasPasswordParam(parsed.connectionString)) {
+    return config.password || parsed.password;
+  }
+  return parsed.password;
+}
+
 export function applyParsedConnectionUrl(config: Omit<ConnectionConfig, "id">, parsed: ParsedConnectionUrl): Omit<ConnectionConfig, "id"> {
   return {
     ...config,
@@ -494,8 +605,9 @@ export function applyParsedConnectionUrl(config: Omit<ConnectionConfig, "id">, p
     driver_label: parsed.driverLabel,
     host: parsed.host,
     port: parsed.port,
-    username: parsed.username,
-    password: parsed.password,
+    name: parsed.name?.trim() || config.name,
+    username: applyParsedUsername(config, parsed),
+    password: applyParsedPassword(config, parsed),
     database: parsed.database,
     url_params: parsed.urlParams,
     ssl: parsed.ssl,

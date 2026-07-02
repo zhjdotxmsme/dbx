@@ -7,11 +7,20 @@ import Database from "better-sqlite3";
 import { sqlSafetyFromEnv } from "./sql-safety.js";
 import { isDirectQueryType } from "./diagnostics.js";
 import { bridgePortFilePath } from "./paths.js";
+import { parseRedisCommandArgv, classifyRedisCommand, type RedisCommandOptions, type RedisCommandResult, type RedisCommandSafety } from "./redis-command.js";
 
 export interface TableInfo {
   name: string;
   type: string;
 }
+
+export interface CollectionInfo {
+  name: string;
+  id?: string;
+  dimension?: number | null;
+}
+
+type CollectionListEntry = string | CollectionInfo;
 
 export interface ColumnInfo {
   name: string;
@@ -161,6 +170,11 @@ function firstProxyLayer(config: ConnectionConfig): ProxyLayer | undefined {
   return config.transport_layers?.find((layer): layer is ProxyLayer => layer.type === "proxy" && layer.enabled !== false && !!layer.host);
 }
 
+function hasDirectRedisSupport(config: ConnectionConfig): boolean {
+  const mode = config.redis_connection_mode || "standalone";
+  return config.db_type === "redis" && mode === "standalone" && !hasActiveSshLayer(config);
+}
+
 async function connectionEndpoint(config: ConnectionConfig): Promise<{ host: string; port: number }> {
   const proxy = firstProxyLayer(config);
   if (!proxy) return { host: config.host, port: config.port };
@@ -192,14 +206,101 @@ async function connectionEndpoint(config: ConnectionConfig): Promise<{ host: str
   return { host: "127.0.0.1", port };
 }
 
-function buildConnectionUrl(config: ConnectionConfig, endpoint: { host: string; port: number }): string {
+export function buildConnectionUrl(config: ConnectionConfig, endpoint: { host: string; port: number }): string {
   const db = config.database || "";
-  const params = config.url_params || "";
-  const suffix = params ? `?${params}` : "";
   if (isMysqlType(config.db_type)) {
+    const params = config.url_params || "";
+    const suffix = params ? `?${params}` : "";
     return `mysql://${encodeURIComponent(config.username)}:${encodeURIComponent(config.password)}@${endpoint.host}:${endpoint.port}/${db}${suffix}`;
   }
+  if (!isPostgresType(config.db_type)) {
+    throw new Error(`Unsupported pooled connection type: ${config.db_type}`);
+  }
+  const params = normalizePostgresUrlParams(config.url_params || "", config.ssl);
+  const suffix = params ? `?${params}` : "";
   return `postgres://${encodeURIComponent(config.username)}:${encodeURIComponent(config.password)}@${endpoint.host}:${endpoint.port}/${db}${suffix}`;
+}
+
+function normalizePostgresUrlParams(value: string, forceTls: boolean): string {
+  const parts: string[] = [];
+  let timezone: string | undefined;
+  let searchPath: string | undefined;
+  for (const part of value.trim().replace(/^\?/, "").split("&")) {
+    if (!part) continue;
+    const [rawKey, rawValue] = splitUrlParam(part);
+    const key = decodeUrlParamPart(rawKey);
+    const lowerKey = key.toLowerCase();
+    if (lowerKey === "timezone" || lowerKey === "time_zone") {
+      const decoded = decodeUrlParamPart(rawValue).trim();
+      if (decoded) timezone = decoded;
+      continue;
+    }
+    if (lowerKey === "schema" || lowerKey === "currentschema") {
+      const decoded = decodeUrlParamPart(rawValue).trim();
+      if (decoded) searchPath = decoded;
+      continue;
+    }
+    if (lowerKey === "ssl-mode") {
+      const value = decodeUrlParamPart(rawValue).toLowerCase().replaceAll("_", "-");
+      if (value === "require" || value === "required") parts.push("sslmode=require");
+      else if (value === "prefer" || value === "preferred") parts.push("sslmode=prefer");
+      else if (value === "disable" || value === "disabled") parts.push("sslmode=disable");
+      else if (value === "verify-ca") parts.push("sslmode=verify-ca");
+      else if (value === "verify-full" || value === "verify-identity") parts.push("sslmode=verify-full");
+      continue;
+    }
+    if (lowerKey === "charset" || lowerKey === "require_ssl" || lowerKey === "verify_ca" || lowerKey === "verify_identity") {
+      continue;
+    }
+    parts.push(part);
+  }
+
+  const connectionOptions: Array<{ needle: string; value: string }> = [];
+  if (searchPath) connectionOptions.push({ needle: "search_path=", value: `-c search_path=${searchPath}` });
+  if (timezone) connectionOptions.push({ needle: "timezone=", value: `-c TimeZone=${timezone}` });
+  if (connectionOptions.length > 0) {
+    const optionsIndex = parts.findIndex((part) => urlParamKeyIs(part, "options"));
+    if (optionsIndex >= 0) {
+      const [rawKey, rawValue] = splitUrlParam(parts[optionsIndex]);
+      const optionsValue = decodeUrlParamPart(rawValue);
+      const lowerOptions = optionsValue.toLowerCase();
+      const appended = connectionOptions.filter((option) => !lowerOptions.includes(option.needle)).map((option) => option.value).join(" ");
+      if (appended) {
+        const combined = `${optionsValue.trim()} ${appended}`.trim();
+        parts[optionsIndex] = `${rawKey}=${encodeURIComponent(combined)}`;
+      }
+    } else {
+      parts.push(`options=${encodeURIComponent(connectionOptions.map((option) => option.value).join(" "))}`);
+    }
+  }
+
+  if (forceTls && !parts.some((part) => urlParamKeyIs(part, "sslmode"))) {
+    parts.unshift("sslmode=require");
+  }
+  return parts.join("&");
+}
+
+function urlParamKeyIs(part: string, expected: string): boolean {
+  const [rawKey] = splitUrlParam(part);
+  return decodeUrlParamPart(rawKey).toLowerCase() === expected.toLowerCase();
+}
+
+function splitUrlParam(part: string): [string, string] {
+  const index = part.indexOf("=");
+  if (index < 0) return [part, ""];
+  return [part.slice(0, index), part.slice(index + 1)];
+}
+
+function decodeUrlParamPart(value: string): string {
+  try {
+    return decodeURIComponent(value.replace(/\+/g, " "));
+  } catch {
+    return value;
+  }
+}
+
+function urlParams(config: ConnectionConfig): URLSearchParams {
+  return new URLSearchParams((config.url_params || "").trim().replace(/^\?/, ""));
 }
 
 function connectViaProxy(config: ConnectionConfig, proxy: ProxyLayer): Promise<Socket> {
@@ -295,6 +396,10 @@ function isMysqlType(dbType: string): boolean {
   return dbType === "mysql" || dbType === "doris" || dbType === "starrocks" || dbType === "manticoresearch";
 }
 
+function isPostgresType(dbType: string): boolean {
+  return dbType === "postgres" || dbType === "redshift" || dbType === "gaussdb" || dbType === "kwdb" || dbType === "opengauss" || dbType === "questdb";
+}
+
 interface BridgeQueryResult {
   columns: string[];
   rows: unknown[][];
@@ -319,6 +424,13 @@ interface BridgeColumnInfo {
   numeric_precision?: number | null;
   numeric_scale?: number | null;
   character_maximum_length?: number | null;
+}
+
+export function collectionListToTableInfos(collections: CollectionListEntry[]): TableInfo[] {
+  return collections.map((collection) => ({
+    name: typeof collection === "string" ? collection : collection.name,
+    type: "COLLECTION",
+  }));
 }
 
 interface MongoDocumentResult {
@@ -514,8 +626,13 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
   if (config.db_type === "mongodb") {
     const find = parseMongoFindCommand(sql);
     if (find) {
-      const result = await withTimeout(mongoFindDocuments(config, find.collection, find.skip, find.limit, find.filter, find.sort), resolveTimeoutMs(options));
+      const result = await withTimeout(mongoFindDocuments(config, find.collection, find.skip, find.limit, find.filter, find.projection, find.sort), resolveTimeoutMs(options));
       return mongoDocumentsToQueryResult(result.documents.slice(0, resolveMaxRows(options)), result.total);
+    }
+    const version = parseMongoVersionCommand(sql);
+    if (version) {
+      const result = await withTimeout(mongoServerVersion(config), resolveTimeoutMs(options));
+      return { columns: ["version"], rows: [{ version: result }], row_count: 1 };
     }
     const count = parseMongoCountDocumentsCommand(sql);
     if (count) {
@@ -541,7 +658,7 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
       const affected = await withTimeout(executeMongoWrite(config, write), resolveTimeoutMs(options));
       return { columns: [], rows: [], row_count: affected };
     }
-    throw new Error("Use MongoDB shell-style commands, for example: db.projects.find({}).limit(100), db.projects.countDocuments({}), db.projects.getIndexes(), db.projects.insertOne({...}), db.projects.updateOne({...}, {$set: {...}}), or db.projects.deleteOne({...})");
+    throw new Error("Use MongoDB shell-style commands, for example: db.projects.find({}).limit(100), db.version(), db.projects.countDocuments({}), db.projects.getIndexes(), db.projects.insertOne({...}), db.projects.updateOne({...}, {$set: {...}}), or db.projects.deleteOne({...})");
   }
   if (isDirectQueryType(config.db_type)) {
     return query(config, sql, undefined, options);
@@ -557,14 +674,104 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
   return convertBridgeQueryResult(result, options);
 }
 
+export async function executeRedisCommand(config: ConnectionConfig, db: number, command: string, options?: RedisCommandOptions): Promise<RedisCommandResult> {
+  if (config.db_type !== "redis") {
+    throw new Error("Connection is not Redis.");
+  }
+  if (hasDirectRedisSupport(config)) {
+    return executeRedisCommandDirect(config, db, command, options);
+  }
+  return withTimeout(
+    bridgeDataRequest<RedisCommandResult>("/data/redis/execute-command", {
+      connection_name: config.name,
+      db,
+      command,
+      skip_safety_check: options?.skipSafetyCheck ?? false,
+    }),
+    resolveTimeoutMs(options),
+  );
+}
+
+async function executeRedisCommandDirect(config: ConnectionConfig, db: number, commandText: string, options?: RedisCommandOptions): Promise<RedisCommandResult> {
+  const argv = parseRedisCommandArgv(commandText);
+  const command = argv[0].toUpperCase();
+  const safety = classifyRedisCommand(command) as RedisCommandSafety;
+  if (!options?.skipSafetyCheck && safety === "blocked") {
+    throw new Error(`Redis command is blocked for safety: ${command}`);
+  }
+
+  const { Redis } = await import("ioredis");
+  const endpoint = await connectionEndpoint(config);
+  const tls = await redisTlsOptions(config);
+  const client = new Redis({
+    host: endpoint.host,
+    port: endpoint.port,
+    username: config.username || undefined,
+    password: config.password || undefined,
+    db,
+    tls,
+    lazyConnect: true,
+    enableReadyCheck: false,
+    maxRetriesPerRequest: 0,
+    enableOfflineQueue: false,
+    connectTimeout: Math.min(resolveTimeoutMs(options), 10_000),
+    commandTimeout: resolveTimeoutMs(options),
+  });
+
+  try {
+    await client.connect();
+    const value = await client.call(command, ...argv.slice(1));
+    return { command, safety, value: redisValueToJson(value) };
+  } finally {
+    client.disconnect();
+  }
+}
+
+async function redisTlsOptions(config: ConnectionConfig): Promise<import("node:tls").ConnectionOptions | undefined> {
+  if (!config.ssl) return undefined;
+  const params = urlParams(config);
+  const tls: import("node:tls").ConnectionOptions = {
+    servername: config.host,
+  };
+  if ((params.get("insecure") || "").toLowerCase() === "true") {
+    tls.rejectUnauthorized = false;
+  }
+  if (config.ca_cert_path) tls.ca = await readFile(config.ca_cert_path);
+  if (config.client_cert_path) tls.cert = await readFile(config.client_cert_path);
+  if (config.client_key_path) tls.key = await readFile(config.client_key_path);
+  return tls;
+}
+
+function redisValueToJson(value: unknown): unknown {
+  if (Buffer.isBuffer(value)) return redisTextToJson(value.toString("utf8"));
+  if (Array.isArray(value)) return value.map(redisValueToJson);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redisValueToJson(item)]));
+  }
+  if (typeof value === "string") return redisTextToJson(value);
+  return value;
+}
+
+function redisTextToJson(value: string): unknown {
+  const trimmed = value.trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return value;
+    }
+  }
+  return value;
+}
+
 export async function listTables(config: ConnectionConfig, schema?: string): Promise<TableInfo[]> {
   if (config.db_type === "mongodb") {
-    const collections = await bridgeDataRequest<string[]>("/data/mongo/list-collections", {
+    const collections = await bridgeDataRequest<CollectionListEntry[]>("/data/mongo/list-collections", {
       connection_name: config.name,
       database: config.database || "",
       schema: schema || "",
     });
-    return collections.map((name) => ({ name, type: "COLLECTION" }));
+    return collectionListToTableInfos(collections);
   }
   if (config.db_type === "sqlite" || config.db_type === "rqlite") {
     const result = await query(config, `SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name`);
@@ -646,7 +853,7 @@ export async function describeTable(config: ConnectionConfig, table: string, sch
   }));
 }
 
-async function mongoFindDocuments(config: ConnectionConfig, collection: string, skip: number, limit: number, filter: string, sort?: string): Promise<MongoDocumentResult> {
+async function mongoFindDocuments(config: ConnectionConfig, collection: string, skip: number, limit: number, filter: string, projection?: string, sort?: string): Promise<MongoDocumentResult> {
   return bridgeDataRequest<MongoDocumentResult>("/data/mongo/find-documents", {
     connection_name: config.name,
     database: config.database || "",
@@ -654,7 +861,15 @@ async function mongoFindDocuments(config: ConnectionConfig, collection: string, 
     skip,
     limit,
     filter,
+    projection,
     sort,
+  });
+}
+
+async function mongoServerVersion(config: ConnectionConfig): Promise<string> {
+  return bridgeDataRequest<string>("/data/mongo/server-version", {
+    connection_name: config.name,
+    database: config.database || "",
   });
 }
 
@@ -699,7 +914,7 @@ async function mongoAggregateDocuments(config: ConnectionConfig, collection: str
   });
 }
 
-export function mongoDocumentsToQueryResult(documents: unknown[], total: number): QueryResult {
+export function mongoDocumentsToQueryResult(documents: unknown[], _total: number): QueryResult {
   const columns: string[] = [];
   for (const doc of documents) {
     if (isRecord(doc)) {
@@ -749,6 +964,7 @@ export function inferMongoColumns(documents: unknown[]): ColumnInfo[] {
 interface MongoFindCommand {
   collection: string;
   filter: string;
+  projection?: string;
   skip: number;
   limit: number;
   sort?: string;
@@ -778,8 +994,15 @@ export function parseMongoFindCommand(input: string): MongoFindCommand | null {
   const findCloseIndex = findMatchingParen(source, findOpenIndex);
   if (findCloseIndex < 0) return null;
   const findArgs = splitTopLevel(source.slice(findOpenIndex + 1, findCloseIndex));
+  if (findArgs.length > 2 && findArgs.slice(2).some((arg) => arg.trim())) return null;
   const filter = normalizeJsonArgument(findArgs[0] || "{}");
   if (!filter) return null;
+  let projection: string | undefined;
+  if (findArgs[1]?.trim()) {
+    const parsedProjection = normalizeJsonArgument(findArgs[1]);
+    if (!parsedProjection) return null;
+    projection = parsedProjection;
+  }
   const chain = source.slice(findCloseIndex + 1).trim();
   if (chain && !chain.startsWith(".")) return null;
   const sortArg = readChainedCallArgument(chain, "sort");
@@ -792,7 +1015,12 @@ export function parseMongoFindCommand(input: string): MongoFindCommand | null {
   const skip = readChainedIntegerArgument(chain, "skip", 0);
   const limit = readChainedIntegerArgument(chain, "limit", MAX_ROWS);
   if (skip === null || limit === null) return null;
-  return { collection: target.collection, filter, skip, limit, sort };
+  return { collection: target.collection, filter, ...(projection ? { projection } : {}), skip, limit, sort };
+}
+
+export function parseMongoVersionCommand(input: string): boolean {
+  const source = input.trim().replace(/;$/, "").trim();
+  return /^db\s*\.\s*version\s*\(\s*\)$/i.test(source);
 }
 
 export function parseMongoCountDocumentsCommand(input: string): MongoCountDocumentsCommand | null {

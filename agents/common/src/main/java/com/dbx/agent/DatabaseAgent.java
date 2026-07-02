@@ -3,7 +3,10 @@ package com.dbx.agent;
 import java.sql.Connection;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 public interface DatabaseAgent {
     void connect(ConnectParams params);
@@ -14,7 +17,19 @@ public interface DatabaseAgent {
 
     List<String> listSchemas();
 
+    default List<String> listSchemas(List<String> visibleSchemas) {
+        if (visibleSchemas == null) {
+            return listSchemas();
+        }
+        Set<String> visible = new HashSet<>(visibleSchemas);
+        return listSchemas().stream().filter(visible::contains).collect(Collectors.toList());
+    }
+
     List<TableInfo> listTables(String schema);
+
+    default List<TableInfo> listTables(String schema, List<String> objectTypes) {
+        return listTables(schema);
+    }
 
     default List<ObjectInfo> listObjects(String schema) {
         List<ObjectInfo> result = new ArrayList<>();
@@ -22,6 +37,10 @@ public interface DatabaseAgent {
             result.add(new ObjectInfo(table.getName(), table.getTable_type(), schema, table.getComment()));
         }
         return result;
+    }
+
+    default List<String> listDataTypes() {
+        return Collections.emptyList();
     }
 
     default CompletionAssistantResponse completionAssistantSearch(CompletionAssistantRequest request) {
@@ -91,6 +110,29 @@ public interface DatabaseAgent {
         return JdbcExecutor.INSTANCE.closeQuerySession(sessionId);
     }
 
+    default QueryPageResult startTableRead(String sql, String schema, QueryPageOptions options) {
+        Connection conn = getConnection();
+        if (conn == null) {
+            throw new IllegalStateException("Not connected");
+        }
+        return JdbcExecutor.INSTANCE.startTableRead(
+            conn,
+            sql,
+            schema,
+            this::setSchemaSQL,
+            options,
+            JdbcExecutor.INSTANCE::defaultResultValue
+        );
+    }
+
+    default QueryPageResult fetchTableReadPage(String sessionId, int pageSize) {
+        return JdbcExecutor.INSTANCE.fetchTableReadPage(sessionId, pageSize);
+    }
+
+    default boolean closeTableReadSession(String sessionId) {
+        return JdbcExecutor.INSTANCE.closeTableReadSession(sessionId);
+    }
+
     /**
      * Get DM execution plan. Supports two modes:
      *   mode="explain" (default) — direct plan, no execution
@@ -111,6 +153,14 @@ public interface DatabaseAgent {
             throw new IllegalStateException("Not connected");
         }
         return TransactionExecutor.executeUpdateStatements(conn, statements, schema, this::setSchemaSQL);
+    }
+
+    default QueryResult executeBatch(List<String> statements, String schema) {
+        Connection conn = getConnection();
+        if (conn == null) {
+            throw new IllegalStateException("Not connected");
+        }
+        return BatchExecutor.executeBatchStatements(conn, statements, schema, this::setSchemaSQL);
     }
 
     default String setSchemaSQL(String schema) {

@@ -8,6 +8,7 @@ import LightDropdown from "@/components/ui/LightDropdown.vue";
 import WindowControls from "@/components/layout/WindowControls.vue";
 import ExportProgressPopover from "@/components/export/ExportProgressPopover.vue";
 import { shouldReserveMacTrafficLightInset, useWindowControls } from "@/composables/useWindowControls";
+import { useToast } from "@/composables/useToast";
 import { useSettingsStore } from "@/stores/settingsStore";
 import type { AppThemeMode } from "@/lib/appTheme";
 
@@ -53,19 +54,33 @@ const emit = defineEmits<{
 }>();
 
 const { t } = useI18n();
+const { toast } = useToast();
 const settingsStore = useSettingsStore();
 const toolbarItems = computed(() => settingsStore.editorSettings.toolbarItems);
 const { isMac, isDesktop, showControls, isMaximized, isFullscreen, minimize, toggleMaximize, close } = useWindowControls();
 
-const themeItems = computed(() => [
-  { value: "light", label: t("toolbar.themeLight"), icon: Sun },
-  { value: "dark", label: t("toolbar.themeDark"), icon: Moon },
-  { value: "system", label: t("toolbar.themeSystem"), icon: SunMoon },
-]);
 const themeTriggerIcon = computed(() => {
   if (props.themeMode === "system") return SunMoon;
   return props.isDark ? Moon : Sun;
 });
+
+function nextThemeMode(mode: AppThemeMode): AppThemeMode {
+  if (mode === "light") return "dark";
+  if (mode === "dark") return "system";
+  return "light";
+}
+
+function themeModeLabel(mode: AppThemeMode): string {
+  if (mode === "light") return t("toolbar.themeLight");
+  if (mode === "dark") return t("toolbar.themeDark");
+  return t("toolbar.themeSystem");
+}
+
+function cycleThemeMode() {
+  const next = nextThemeMode(props.themeMode);
+  emit("set-theme-mode", next);
+  toast(`${t("toolbar.theme")}: ${themeModeLabel(next)}`, 1600);
+}
 
 function onToolbarDblClick(e: MouseEvent) {
   if (isDesktop) return;
@@ -149,8 +164,8 @@ const collapsibleRightItemDefs = computed(() => {
     items.push({
       key: "theme",
       label: t("toolbar.theme"),
-      icon: SunMoon,
-      action: () => {},
+      icon: themeTriggerIcon.value,
+      action: cycleThemeMode,
       disabled: false,
     });
   }
@@ -322,6 +337,16 @@ const collapsedItems = computed(() => {
   return items;
 });
 
+function runMoreItem(value: string) {
+  const item = moreItems.value.find((i) => i.value === value);
+  item?.action();
+}
+
+function runCollapsedItem(value: string) {
+  const item = collapsedItems.value.find((i) => i.value === value);
+  item?.action();
+}
+
 // Per-item overflow visibility helper
 function isRightItemVisible(key: string) {
   return !overflowedRightKeys.value.has(key);
@@ -329,29 +354,33 @@ function isRightItemVisible(key: string) {
 
 // Track checking updates state for the overflow menu disabled state
 const checkingUpdates = computed(() => props.checkingUpdates);
+
+const toolbarTextButtonClass = "h-8 px-2 text-xs gap-1 leading-none";
+const toolbarTextLabelClass = "inline-flex translate-y-px items-center leading-none";
+const toolbarDropdownTriggerClass = `inline-flex h-8 items-center gap-1 rounded-[6px] px-2 text-xs font-medium leading-none hover:bg-muted hover:text-foreground dark:hover:bg-muted/50 transition-colors [&>span:first-child]:translate-y-px`;
 </script>
 
 <template>
   <div ref="toolbarEl" class="h-10 flex items-center gap-1 px-2 border-b bg-muted/30 shrink-0 overflow-hidden" :class="{ 'pl-17.5': shouldReserveMacTrafficLightInset(isMac, isFullscreen, isDesktop) }" data-tauri-drag-region @dblclick="onToolbarDblClick">
-    <Button variant="ghost" size="sm" class="h-8 px-2 text-xs gap-1" @click="emit('new-connection')">
+    <Button variant="ghost" size="sm" :class="toolbarTextButtonClass" @click="emit('new-connection')">
       <DatabaseZap class="h-3.5 w-3.5" />
-      {{ t("toolbar.newConnection") }}
+      <span :class="toolbarTextLabelClass">{{ t("toolbar.newConnection") }}</span>
     </Button>
 
-    <Button variant="ghost" size="sm" class="h-8 px-2 text-xs gap-1" @click="emit('new-query')" :disabled="!hasConnections">
+    <Button variant="ghost" size="sm" :class="toolbarTextButtonClass" @click="emit('new-query')" :disabled="!hasConnections">
       <FilePlus2 class="h-3.5 w-3.5" />
-      {{ t("toolbar.newQuery") }}
+      <span :class="toolbarTextLabelClass">{{ t("toolbar.newQuery") }}</span>
     </Button>
 
     <template v-if="!toolbarCollapsed">
-      <Button v-if="toolbarItems.dataTransfer" variant="ghost" size="sm" class="h-8 px-2 text-xs gap-1" @click="emit('open-transfer')" :disabled="!hasConnections">
+      <Button v-if="toolbarItems.dataTransfer" variant="ghost" size="sm" :class="toolbarTextButtonClass" @click="emit('open-transfer')" :disabled="!hasConnections">
         <ArrowLeftRight class="h-3.5 w-3.5" />
-        {{ t("transfer.dataTransfer") }}
+        <span :class="toolbarTextLabelClass">{{ t("transfer.dataTransfer") }}</span>
       </Button>
 
-      <Button v-if="toolbarItems.driverManager" variant="ghost" size="sm" class="h-8 px-2 text-xs gap-1" :class="{ 'bg-accent': showDriverStore }" @click="emit('open-driver-store')">
+      <Button v-if="toolbarItems.driverManager" variant="ghost" size="sm" :class="[toolbarTextButtonClass, { 'bg-accent': showDriverStore }]" @click="emit('open-driver-store')">
         <Package class="h-3.5 w-3.5" />
-        {{ t("toolbar.driverManager") }}
+        <span :class="toolbarTextLabelClass">{{ t("toolbar.driverManager") }}</span>
         <span v-if="agentDriverUpdateCount > 0" class="ml-0.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-red-500 px-1 text-[10px] font-medium leading-none text-white" :aria-label="t('toolbar.updatableDriverCount')">
           {{ agentDriverUpdateCount > 99 ? "99+" : agentDriverUpdateCount }}
         </span>
@@ -363,17 +392,12 @@ const checkingUpdates = computed(() => props.checkingUpdates);
         :items="moreItems"
         :aria-label="t('common.more')"
         :trigger-label="t('common.more')"
-        trigger-class="inline-flex h-8 items-center gap-1 rounded-lg px-2 text-xs font-medium hover:bg-muted hover:text-foreground dark:hover:bg-muted/50 transition-colors"
+        :trigger-class="toolbarDropdownTriggerClass"
         :show-trigger-label="true"
         :show-chevron="true"
         check-position="none"
         align="start"
-        @update:model-value="
-          (value) => {
-            const item = moreItems.find((i) => i.value === value);
-            item?.action();
-          }
-        "
+        @update:model-value="runMoreItem"
       />
     </template>
 
@@ -384,17 +408,12 @@ const checkingUpdates = computed(() => props.checkingUpdates);
         :items="collapsedItems"
         :aria-label="t('common.more')"
         :trigger-label="t('common.more')"
-        trigger-class="inline-flex h-8 items-center gap-1 rounded-lg px-2 text-xs font-medium hover:bg-muted hover:text-foreground dark:hover:bg-muted/50 transition-colors"
+        :trigger-class="toolbarDropdownTriggerClass"
         :show-trigger-label="true"
         :show-chevron="true"
         check-position="none"
         align="start"
-        @update:model-value="
-          (value) => {
-            const item = collapsedItems.find((i) => i.value === value);
-            item?.action();
-          }
-        "
+        @update:model-value="runCollapsedItem"
       />
     </template>
 
@@ -448,22 +467,9 @@ const checkingUpdates = computed(() => props.checkingUpdates);
 
       <Tooltip v-if="toolbarItems.theme">
         <TooltipTrigger as-child>
-          <span v-show="isRightItemVisible('theme')" class="inline-flex shrink-0">
-            <LightDropdown
-              :model-value="themeMode"
-              :items="themeItems"
-              :aria-label="t('toolbar.theme')"
-              :trigger-icon="themeTriggerIcon"
-              trigger-class="inline-flex h-8 w-8 items-center justify-center rounded-md hover:bg-accent hover:text-accent-foreground"
-              trigger-icon-class="h-4 w-4"
-              item-icon-class="h-4 w-4"
-              :show-trigger-label="false"
-              :show-chevron="false"
-              check-position="right"
-              align="end"
-              @update:model-value="(value) => emit('set-theme-mode', value as AppThemeMode)"
-            />
-          </span>
+          <Button v-show="isRightItemVisible('theme')" variant="ghost" size="icon" class="h-8 w-8 shrink-0" :aria-label="t('toolbar.theme')" @click="cycleThemeMode">
+            <component :is="themeTriggerIcon" class="h-4 w-4" />
+          </Button>
         </TooltipTrigger>
         <TooltipContent>{{ t("toolbar.theme") }}</TooltipContent>
       </Tooltip>

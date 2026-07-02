@@ -4,8 +4,7 @@ use tauri::State;
 
 pub use dbx_core::agent_connection::{
     agent_connect_params, mongo_legacy_error_with_auth_hint, mongo_uses_legacy_driver, oracle_alternate_connect_config,
-    oracle_auth_fallback_profiles, oracle_error_with_driver_hint, should_retry_mongo_with_legacy_driver,
-    should_retry_oracle_with_10g_driver,
+    oracle_error_with_driver_hint, should_retry_mongo_with_legacy_driver,
 };
 pub use dbx_core::connection::{
     agent_connect_timeout, connect_bare_metadata_pool, connect_mysql_metadata_pool, connection_url_for_endpoint,
@@ -67,7 +66,7 @@ async fn test_agent_connection(
             &config.db_type,
             config.driver_profile.as_deref(),
             AgentMethod::TestConnection,
-            connect_params.clone(),
+            connect_params,
             Some(agent_connect_timeout(config)),
         )
         .await;
@@ -92,34 +91,6 @@ async fn test_agent_connection(
                 .map_err(|alternate_err| {
                     format!("{err}\n\nFallback with alternate Oracle descriptor failed: {alternate_err}")
                 })?;
-        } else if should_retry_oracle_with_10g_driver(config, &err) {
-            let mut fallback_errors = Vec::new();
-            let mut connected = false;
-            for profile in oracle_auth_fallback_profiles(config, &err) {
-                match state
-                    .agent_manager
-                    .call_daemon_method_with_timeout::<serde_json::Value>(
-                        &config.db_type,
-                        Some(profile),
-                        AgentMethod::TestConnection,
-                        connect_params.clone(),
-                        Some(agent_connect_timeout(config)),
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        connected = true;
-                        break;
-                    }
-                    Err(fallback_err) => fallback_errors.push(format!("{profile}: {fallback_err}")),
-                }
-            }
-            if !connected {
-                return Err(format!(
-                    "{err}\n\nFallback with legacy Oracle drivers failed: {}",
-                    fallback_errors.join("\n")
-                ));
-            }
         } else {
             return Err(oracle_error_with_driver_hint(config, &err));
         }
@@ -139,7 +110,7 @@ async fn connect_agent_pool(
     let connect_result = client
         .call_method_with_timeout::<serde_json::Value>(
             AgentMethod::Connect,
-            connect_params.clone(),
+            connect_params,
             Some(agent_connect_timeout(config)),
         )
         .await;
@@ -161,33 +132,6 @@ async fn connect_agent_pool(
                 .map_err(|alternate_err| {
                     format!("{err}\n\nFallback with alternate Oracle descriptor failed: {alternate_err}")
                 })?;
-        } else if should_retry_oracle_with_10g_driver(config, &err) {
-            let mut fallback_errors = Vec::new();
-            let mut connected_client = None;
-            for profile in oracle_auth_fallback_profiles(config, &err) {
-                match state.agent_manager.spawn(&config.db_type, Some(profile)).await {
-                    Ok(mut fallback_client) => {
-                        match fallback_client
-                            .call_method_with_timeout::<serde_json::Value>(
-                                AgentMethod::Connect,
-                                connect_params.clone(),
-                                Some(agent_connect_timeout(config)),
-                            )
-                            .await
-                        {
-                            Ok(_) => {
-                                connected_client = Some(fallback_client);
-                                break;
-                            }
-                            Err(fallback_err) => fallback_errors.push(format!("{profile}: {fallback_err}")),
-                        }
-                    }
-                    Err(fallback_err) => fallback_errors.push(format!("{profile}: {fallback_err}")),
-                }
-            }
-            client = connected_client.ok_or_else(|| {
-                format!("{err}\n\nFallback with legacy Oracle drivers failed: {}", fallback_errors.join("\n"))
-            })?;
         } else {
             return Err(oracle_error_with_driver_hint(config, &err));
         }
@@ -248,6 +192,7 @@ mod tests {
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
             redis_key_separator: dbx_core::models::connection::default_redis_key_separator(),
+            redis_scan_page_size: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -604,12 +549,7 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                         extension
                     })
                     .collect();
-                match db::sqlite::connect_path_create_if_missing_with_extensions(
-                    &expand_tilde(&config.host),
-                    extensions,
-                )
-                .await
-                {
+                match db::sqlite::connect_path_with_extensions(&expand_tilde(&config.host), extensions).await {
                     Ok(_) => Ok("Connection successful".to_string()),
                     Err(e) => Err(e),
                 }
@@ -713,11 +653,12 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                     .await
                     .map(|_| "Connection successful".to_string())
             }
-            DatabaseType::Qdrant | DatabaseType::Milvus | DatabaseType::Weaviate => {
+            DatabaseType::Qdrant | DatabaseType::Milvus | DatabaseType::Weaviate | DatabaseType::ChromaDb => {
                 let kind = match config.db_type {
                     DatabaseType::Qdrant => db::vector_driver::VectorDbKind::Qdrant,
                     DatabaseType::Milvus => db::vector_driver::VectorDbKind::Milvus,
                     DatabaseType::Weaviate => db::vector_driver::VectorDbKind::Weaviate,
+                    DatabaseType::ChromaDb => db::vector_driver::VectorDbKind::ChromaDb,
                     _ => unreachable!(),
                 };
                 let client = db::vector_driver::VectorClient::new(
@@ -777,6 +718,7 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                     &url,
                     username,
                     password,
+                    config.url_params.clone(),
                     Some(&config.ca_cert_path),
                     connect_timeout,
                 )?;
@@ -872,8 +814,7 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
                 })
                 .collect();
             PoolKind::Sqlite(
-                db::sqlite::connect_path_create_if_missing_with_extensions(&expand_tilde(&db_config.host), extensions)
-                    .await?,
+                db::sqlite::connect_path_with_extensions(&expand_tilde(&db_config.host), extensions).await?,
             )
         }
         DatabaseType::Redis => {
@@ -999,11 +940,12 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
             db::elasticsearch_driver::test_connection(&mut client, connect_timeout).await?;
             PoolKind::Elasticsearch(client)
         }
-        DatabaseType::Qdrant | DatabaseType::Milvus | DatabaseType::Weaviate => {
+        DatabaseType::Qdrant | DatabaseType::Milvus | DatabaseType::Weaviate | DatabaseType::ChromaDb => {
             let kind = match db_config.db_type {
                 DatabaseType::Qdrant => db::vector_driver::VectorDbKind::Qdrant,
                 DatabaseType::Milvus => db::vector_driver::VectorDbKind::Milvus,
                 DatabaseType::Weaviate => db::vector_driver::VectorDbKind::Weaviate,
+                DatabaseType::ChromaDb => db::vector_driver::VectorDbKind::ChromaDb,
                 _ => unreachable!(),
             };
             let client = db::vector_driver::VectorClient::new(
@@ -1060,6 +1002,7 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
                 &url,
                 username,
                 password,
+                db_config.url_params,
                 Some(&db_config.ca_cert_path),
                 connect_timeout,
             )?;

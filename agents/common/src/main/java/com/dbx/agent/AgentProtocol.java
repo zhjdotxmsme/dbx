@@ -15,6 +15,7 @@ public final class AgentProtocol {
     public static final String METHOD_LIST_SCHEMAS = "list_schemas";
     public static final String METHOD_LIST_TABLES = "list_tables";
     public static final String METHOD_LIST_OBJECTS = "list_objects";
+    public static final String METHOD_LIST_DATA_TYPES = "list_data_types";
     public static final String METHOD_COMPLETION_ASSISTANT_SEARCH_V1 = "completion_assistant_search_v1";
     public static final String METHOD_GET_OBJECT_SOURCE = "get_object_source";
     public static final String METHOD_GET_TABLE_DDL = "get_table_ddl";
@@ -26,7 +27,11 @@ public final class AgentProtocol {
     public static final String METHOD_EXECUTE_QUERY_PAGE = "execute_query_page";
     public static final String METHOD_FETCH_QUERY_PAGE = "fetch_query_page";
     public static final String METHOD_CLOSE_QUERY_SESSION = "close_query_session";
+    public static final String METHOD_START_TABLE_READ = "start_table_read";
+    public static final String METHOD_FETCH_TABLE_READ_PAGE = "fetch_table_read_page";
+    public static final String METHOD_CLOSE_TABLE_READ_SESSION = "close_table_read_session";
     public static final String METHOD_GET_EXPLAIN_INFO = "get_explain_info";
+    public static final String METHOD_EXECUTE_BATCH = "execute_batch";
     public static final String METHOD_EXECUTE_TRANSACTION = "execute_transaction";
     public static final String METHOD_DISCONNECT = "disconnect";
     public static final String METHOD_SHUTDOWN = "shutdown";
@@ -34,6 +39,7 @@ public final class AgentProtocol {
     public static final String MONGO_METHOD_LIST_DATABASES = "list_databases";
     public static final String MONGO_METHOD_LIST_COLLECTIONS = "list_collections";
     public static final String MONGO_METHOD_FIND_DOCUMENTS = "find_documents";
+    public static final String MONGO_METHOD_SERVER_VERSION = "server_version";
     public static final String MONGO_METHOD_INSERT_DOCUMENT = "insert_document";
     public static final String MONGO_METHOD_UPDATE_DOCUMENT = "update_document";
     public static final String MONGO_METHOD_DELETE_DOCUMENT = "delete_document";
@@ -82,6 +88,7 @@ public final class AgentProtocol {
         METHOD_LIST_SCHEMAS,
         METHOD_LIST_TABLES,
         METHOD_LIST_OBJECTS,
+        METHOD_LIST_DATA_TYPES,
         METHOD_COMPLETION_ASSISTANT_SEARCH_V1,
         METHOD_GET_OBJECT_SOURCE,
         METHOD_GET_TABLE_DDL,
@@ -93,7 +100,11 @@ public final class AgentProtocol {
         METHOD_EXECUTE_QUERY_PAGE,
         METHOD_FETCH_QUERY_PAGE,
         METHOD_CLOSE_QUERY_SESSION,
+        METHOD_START_TABLE_READ,
+        METHOD_FETCH_TABLE_READ_PAGE,
+        METHOD_CLOSE_TABLE_READ_SESSION,
         METHOD_GET_EXPLAIN_INFO,
+        METHOD_EXECUTE_BATCH,
         METHOD_EXECUTE_TRANSACTION,
         METHOD_DISCONNECT,
         METHOD_SHUTDOWN
@@ -103,6 +114,7 @@ public final class AgentProtocol {
         MONGO_METHOD_LIST_DATABASES,
         MONGO_METHOD_LIST_COLLECTIONS,
         MONGO_METHOD_FIND_DOCUMENTS,
+        MONGO_METHOD_SERVER_VERSION,
         MONGO_METHOD_INSERT_DOCUMENT,
         MONGO_METHOD_UPDATE_DOCUMENT,
         MONGO_METHOD_DELETE_DOCUMENT

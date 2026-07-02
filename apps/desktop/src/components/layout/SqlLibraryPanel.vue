@@ -13,6 +13,7 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import { useQueryStore } from "@/stores/queryStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { focusSidebarRenameInput } from "@/lib/sidebarRenameFocus";
+import { savedSqlFolderBranchFileCount } from "@/lib/savedSqlFolderCounts";
 import type { SavedSqlFile, SavedSqlFolder } from "@/types/database";
 
 const { t } = useI18n();
@@ -108,6 +109,8 @@ async function downloadText(content: string, fileName: string) {
 
 async function exportSingleFile(file: SavedSqlFile) {
   try {
+    const loadedFile = await savedSqlStore.ensureFileContent(file.id);
+    if (!loadedFile) return;
     const defaultFileName = sanitizeFileSystemSegment(ensureSqlExtension(file.name));
     if (isTauriRuntime()) {
       const { save } = await import("@tauri-apps/plugin-dialog");
@@ -117,9 +120,9 @@ async function exportSingleFile(file: SavedSqlFile) {
         filters: [{ name: "SQL", extensions: ["sql"] }],
       });
       if (!path) return;
-      await writeTextFile(path, file.sql);
+      await writeTextFile(path, loadedFile.sql);
     } else {
-      await downloadText(file.sql, defaultFileName);
+      await downloadText(loadedFile.sql, defaultFileName);
     }
     toast(t("sqlLibrary.exported"), 2000);
   } catch (e: any) {
@@ -157,8 +160,10 @@ async function exportFolderContents(folder?: SavedSqlFolder) {
         await writeFolder(child, childDir);
       }
       for (const file of savedSqlStore.filesInFolder(libraryFolder.id)) {
+        const loadedFile = await savedSqlStore.ensureFileContent(file.id);
+        if (!loadedFile) continue;
         const filePath = await join(dir, sanitizeFileSystemSegment(ensureSqlExtension(file.name)));
-        await writeTextFile(filePath, file.sql);
+        await writeTextFile(filePath, loadedFile.sql);
       }
     };
 
@@ -176,8 +181,10 @@ async function exportFolderContents(folder?: SavedSqlFolder) {
         const unfiledDir = await join(rootDir, sanitizeFileSystemSegment(t("sqlLibrary.unfiled")));
         await mkdir(unfiledDir, { recursive: true });
         for (const file of unfiled) {
+          const loadedFile = await savedSqlStore.ensureFileContent(file.id);
+          if (!loadedFile) continue;
           const filePath = await join(unfiledDir, sanitizeFileSystemSegment(ensureSqlExtension(file.name)));
-          await writeTextFile(filePath, file.sql);
+          await writeTextFile(filePath, loadedFile.sql);
         }
       }
     }
@@ -340,6 +347,11 @@ function filesInFolder(folderId: string) {
     .filesInFolder(folderId)
     .filter((file) => !orphanedIds.value.has(file.id))
     .filter((file) => includeAllFilesForMatchedFolder || fileMatchesQuery(file));
+}
+
+function folderFileCount(folderId: string) {
+  const visibleFolders = savedSqlStore.allFolders.filter((folder) => isConnectionVisible(folder.connectionId));
+  return savedSqlFolderBranchFileCount(folderId, visibleFolders, filesInFolder);
 }
 
 type SqlLibraryRow = { type: "folder"; folder: SavedSqlFolder; depth: number; folderIndex: number } | { type: "file"; file: SavedSqlFile; depth: number };
@@ -573,11 +585,13 @@ async function executeBatchDelete() {
   toast(t("sqlLibrary.batchDeleteSuccess", { count: fileIds.length + folderIds.length }), 2000);
 }
 
-function openFile(file: SavedSqlFile) {
+async function openFile(file: SavedSqlFile) {
   if (suppressNextRowClick.value) return;
-  queryStore.openSavedSql(file);
-  connectionStore.activeConnectionId = file.connectionId;
-  void savedSqlStore.recordFileUsage(file.id);
+  const loadedFile = await savedSqlStore.ensureFileContent(file.id);
+  if (!loadedFile) return;
+  queryStore.openSavedSql(loadedFile);
+  connectionStore.activeConnectionId = loadedFile.connectionId;
+  void savedSqlStore.recordFileUsage(loadedFile.id);
 }
 
 function handleFileClick(file: SavedSqlFile, event: MouseEvent) {
@@ -1061,7 +1075,7 @@ function showDropInside(targetId: string) {
                   <FolderClosed class="h-4 w-4 text-amber-500 shrink-0" />
                   <span class="dbx-sql-library-drag-label min-w-0 flex-1 truncate">
                     {{ item.item.name }}
-                    <span class="ml-1 text-muted-foreground">({{ filesInFolder(item.item.id).length }})</span>
+                    <span class="ml-1 text-muted-foreground">({{ folderFileCount(item.item.id) }})</span>
                   </span>
                 </div>
 
@@ -1119,7 +1133,7 @@ function showDropInside(targetId: string) {
                   </template>
                   <span v-else class="dbx-sql-library-drag-label min-w-0 flex-1 truncate">
                     {{ row.folder.name }}
-                    <span class="ml-1 text-muted-foreground">({{ filesInFolder(row.folder.id).length }})</span>
+                    <span class="ml-1 text-muted-foreground">({{ folderFileCount(row.folder.id) }})</span>
                   </span>
                 </div>
 

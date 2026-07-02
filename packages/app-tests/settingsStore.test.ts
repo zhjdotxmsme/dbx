@@ -39,15 +39,6 @@ function withMockLocalStorage(initial: Record<string, string>, run: () => void) 
   }
 }
 
-test("defaults Redis scan page size to 1000 keys", () => {
-  assert.equal(DEFAULT_EDITOR_SETTINGS.redisScanPageSize, 1000);
-  assert.equal(normalizeEditorSettings({}).redisScanPageSize, 1000);
-});
-
-test("keeps a saved Redis scan page size", () => {
-  assert.equal(normalizeEditorSettings({ redisScanPageSize: 5000 }).redisScanPageSize, 5000);
-});
-
 test("normalizes saved query result page size", () => {
   assert.equal(DEFAULT_EDITOR_SETTINGS.pageSize, 100);
   assert.equal(normalizeEditorSettings({ pageSize: 5000 }).pageSize, 5000);
@@ -88,14 +79,14 @@ test("keeps a manually saved 10000 export batch size after migration", () => {
 });
 
 test("defaults query-result export row limit settings", () => {
-  assert.equal(DEFAULT_EDITOR_SETTINGS.exportRowLimitEnabled, true);
+  assert.equal(DEFAULT_EDITOR_SETTINGS.exportRowLimitEnabled, false);
   assert.equal(DEFAULT_EDITOR_SETTINGS.exportRowLimit, 100000);
   assert.equal(DEFAULT_EDITOR_SETTINGS.queryExportKeysetOptimizationEnabled, true);
-  assert.equal(normalizeEditorSettings({}).exportRowLimitEnabled, true);
+  assert.equal(normalizeEditorSettings({}).exportRowLimitEnabled, false);
   assert.equal(normalizeEditorSettings({}).exportRowLimit, 100000);
   assert.equal(normalizeEditorSettings({}).queryExportKeysetOptimizationEnabled, true);
-  assert.equal(normalizeEditorSettings({ exportRowLimitEnabled: false }).exportRowLimitEnabled, false);
-  assert.equal(normalizeEditorSettings({ exportRowLimitEnabled: "nope" as any }).exportRowLimitEnabled, true);
+  assert.equal(normalizeEditorSettings({ exportRowLimitEnabled: true }).exportRowLimitEnabled, true);
+  assert.equal(normalizeEditorSettings({ exportRowLimitEnabled: "nope" as any }).exportRowLimitEnabled, false);
   assert.equal(normalizeEditorSettings({ exportRowLimit: 250000 }).exportRowLimit, 250000);
   assert.equal(normalizeEditorSettings({ exportRowLimit: 10 }).exportRowLimit, 100000);
   assert.equal(normalizeEditorSettings({ queryExportKeysetOptimizationEnabled: false }).queryExportKeysetOptimizationEnabled, false);
@@ -197,6 +188,16 @@ test("normalizes data grid render mode", () => {
   assert.equal(normalizeEditorSettings({}).dataGridRenderMode, "canvas");
   assert.equal(normalizeEditorSettings({ dataGridRenderMode: "canvas" as any }).dataGridRenderMode, "canvas");
   assert.equal(normalizeEditorSettings({ dataGridRenderMode: "unknown" as any }).dataGridRenderMode, "canvas");
+});
+
+test("normalizes table font size", () => {
+  assert.equal(DEFAULT_EDITOR_SETTINGS.tableFontSize, 13);
+  assert.equal(normalizeEditorSettings({}).tableFontSize, 13);
+  assert.equal(normalizeEditorSettings({ tableFontSize: 12 }).tableFontSize, 12);
+  assert.equal(normalizeEditorSettings({ tableFontSize: 14.6 }).tableFontSize, 15);
+  assert.equal(normalizeEditorSettings({ tableFontSize: 8 }).tableFontSize, 12);
+  assert.equal(normalizeEditorSettings({ tableFontSize: 20 }).tableFontSize, 16);
+  assert.equal(normalizeEditorSettings({ tableFontSize: "large" as any }).tableFontSize, 13);
 });
 
 test("normalizes table structure editor density", () => {

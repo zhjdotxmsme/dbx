@@ -17,28 +17,32 @@ import type { ConnectionConfig, DatabaseType, JdbcDriverInfo, JdbcMavenBundleInf
 import type { MqAdminConfig, MqAuth, MqSystemKind } from "@/types/mq";
 import type { NacosAdminConfig, NacosAuthConfig } from "@/types/nacos";
 import { useConnectionStore } from "@/stores/connectionStore";
+import { REDIS_SCAN_PAGE_SIZE_DEFAULT, REDIS_SCAN_PAGE_SIZE_MIN, REDIS_SCAN_PAGE_SIZE_MAX, REDIS_SCAN_PAGE_SIZE_OPTIONS } from "@/lib/redisKeyPattern";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import * as api from "@/lib/api";
 import { isTauriRuntime } from "@/lib/tauriRuntime";
 import { applyParsedConnectionUrl, normalizeMongoConnectionString, parseConnectionUrl } from "@/lib/connectionUrl";
-import type { ConnectionDeepLinkDraft } from "@/lib/connectionDeepLink";
+import { parseConnectionDeepLink, type ConnectionDeepLinkDraft } from "@/lib/connectionDeepLink";
 import { connectionUrlPlaceholder as getUrlPlaceholder } from "@/lib/connectionPresentation";
-import { h2ConnectionModeForConfig, h2FileJdbcUrl, h2FilePathFromJdbcUrl, type H2ConnectionMode } from "@/lib/h2Connection";
+import { h2ConnectionModeForConfig, h2FileJdbcUrlWithPath, h2FilePathFromJdbcUrl, isH2SplitJdbcUrl, type H2ConnectionMode } from "@/lib/h2Connection";
 import { firstZooKeeperEndpoint, normalizeZooKeeperConnectString } from "@/lib/zookeeperConnection";
 import { isLocalFileTypeDb } from "@/lib/connectionFile";
 import { MQ_PINNED_VERSION_OPTIONS, pinnedVersionToSelection, selectionToPinnedVersion } from "@/lib/mqPinnedVersionOptions";
 import { mongodbAuthFailureHint, mongoUrlParam, setMongoUrlParam } from "@/lib/mongoConnectionOptions";
 import { copyToClipboard } from "@/lib/clipboard";
-import { showAgentDriverInstallHint, type AgentDriverInstallState } from "@/lib/agentDriverInstallHint";
+import { appendAgentDriverUpdateHint, hasAgentDriverUpdate, showAgentDriverInstallHint, type AgentDriverInstallState } from "@/lib/agentDriverInstallHint";
 import { prestoSqlBuiltinDriverPaths } from "@/lib/prestoSqlBuiltinDriver";
 import { SQLITE_DATABASE_FILE_EXTENSIONS } from "@/lib/databaseFileDetection";
+import { connectionAttemptOriginalErrorMessage, connectionAttemptTimeoutMessage, connectionAttemptTimeoutMs } from "@/lib/connectionAttemptTimeout";
 import { ArrowLeft, ArrowDown, ArrowUp, CheckSquare, ChevronRight, CircleHelp, Copy, ExternalLink, FilePlus2, FolderOpen, GripVertical, Grid3X3, KeyRound, Link2, List, ListFilter, Loader2, Pipette, Plus, Search, ShieldCheck, Square, Trash2 } from "@lucide/vue";
 import { buildDraftVisibleDatabasesConnectionId, connectionCanChooseVisibleDatabases, initialVisibleDatabaseSelection, visibleDatabaseSelectionIsStale } from "@/lib/connectionVisibleDatabases";
-import { canSaveVisibleDatabaseSelection, filterDatabaseNamesForConnection, isSystemDatabaseName, normalizeVisibleDatabaseSelection, buildDraftVisibleSchemasConnectionId } from "@/lib/visibleDatabases";
+import { canSaveVisibleDatabaseSelection, connectionUsesVisibleSchemaFilter, filterDatabaseNamesForConnection, isSystemDatabaseName, normalizeVisibleDatabaseSelection, buildDraftVisibleSchemasConnectionId, normalizeVisibleSchemaSelection } from "@/lib/visibleDatabases";
 import { isSchemaAware } from "@/lib/databaseFeatureSupport";
 import VisibleSchemasDialog from "@/components/sidebar/VisibleSchemasDialog.vue";
+import { oceanbaseModeConnectionPatch, oceanbaseSubModeFromConfig } from "@/lib/oceanbaseConnectionMode";
+import { translateBackendError } from "@/i18n/backend-errors";
 
 type DbOption = { value: string; label: string };
 type DbCategory = { key: string; title: string; options: DbOption[] };
@@ -47,15 +51,21 @@ type DbPickerView = "icon" | "list";
 type ConfigTab = "connection" | "advanced" | "tls" | "transport";
 type MqTokenSigningMode = "none" | "hs256" | "rs256";
 type NacosAuthKind = NacosAuthConfig["kind"];
+type DremioConnectionMode = "arrow-flight-sql" | "legacy";
 type JdbcDriverSelectItem = {
   id: string;
   label: string;
   paths: string[];
 };
 
+const DREMIO_ARROW_FLIGHT_SQL_JDBC_URL = "jdbc:arrow-flight-sql://127.0.0.1:32010";
+const DREMIO_ARROW_FLIGHT_SQL_JDBC_DRIVER_CLASS = "org.apache.arrow.driver.jdbc.ArrowFlightJdbcDriver";
+const DREMIO_LEGACY_JDBC_URL = "jdbc:dremio:direct=127.0.0.1:31010";
+const DREMIO_LEGACY_JDBC_DRIVER_CLASS = "com.dremio.jdbc.Driver";
 const NACOS_DEFAULT_CONSOLE_URL = "http://127.0.0.1:8085";
 const NACOS_LEGACY_SERVER_PORT = "8848";
 const NACOS_DOCKER_CONSOLE_PORT = "8085";
+const DEFAULT_SSH_USER = "root";
 
 type LegacyTransportFields = {
   ssh_enabled?: boolean;
@@ -131,7 +141,7 @@ const defaultForm = (): ConnectionForm => ({
   connect_timeout_secs: 10,
   query_timeout_secs: 30,
   idle_timeout_secs: 60,
-  keepalive_interval_secs: 0,
+  keepalive_interval_secs: 30,
   ssl: false,
   ca_cert_path: "",
   client_cert_path: "",
@@ -149,6 +159,7 @@ const defaultForm = (): ConnectionForm => ({
   redis_sentinel_tls: false,
   redis_cluster_nodes: "",
   redis_key_separator: ":",
+  redis_scan_page_size: REDIS_SCAN_PAGE_SIZE_DEFAULT,
   etcd_endpoints: "",
   gbase_server: "",
   informix_server: "",
@@ -164,7 +175,7 @@ function defaultSshTunnel(): SshTunnelConfig {
     enabled: true,
     host: "",
     port: 22,
-    user: "",
+    user: DEFAULT_SSH_USER,
     password: "",
     key_path: "",
     key_passphrase: "",
@@ -182,7 +193,7 @@ function normalizeSshTunnel(hop: Partial<SshTunnelConfig>): SshTunnelConfig {
     enabled: hop.enabled !== false,
     host: hop.host || "",
     port: Number(hop.port) || 22,
-    user: hop.user || "",
+    user: hop.user?.trim() || DEFAULT_SSH_USER,
     password: hop.password || "",
     key_path: hop.key_path || "",
     key_passphrase: hop.key_passphrase || "",
@@ -297,8 +308,14 @@ const agentDrivers = ref<AgentDriverInstallState[]>([]);
 const selectedJdbcDriverPath = ref("");
 const jdbcManualClasspathOpen = ref(false);
 const connectionUrlInput = ref("");
+const appliedConnectionUrlInput = ref("");
 const oceanbaseSubMode = ref<"mysql" | "oracle">("mysql");
 const h2ConnectionMode = ref<H2ConnectionMode>("file");
+const dremioConnectionMode = ref<DremioConnectionMode>("legacy");
+const dremioConnectionUrls = ref<Record<DremioConnectionMode, string>>({
+  "arrow-flight-sql": DREMIO_ARROW_FLIGHT_SQL_JDBC_URL,
+  legacy: DREMIO_LEGACY_JDBC_URL,
+});
 const dialogStep = ref<DialogStep>("select");
 const dbPickerView = ref<DbPickerView>("icon");
 const dbSearchQuery = ref("");
@@ -435,6 +452,7 @@ const driverProfiles: Record<
   qdrant: { type: "qdrant", port: 6333, user: "", label: "Qdrant", icon: "qdrant" },
   milvus: { type: "milvus", port: 19530, user: "root", label: "Milvus", icon: "milvus" },
   weaviate: { type: "weaviate", port: 8080, user: "", label: "Weaviate", icon: "weaviate" },
+  chromadb: { type: "chromadb", port: 8000, user: "", label: "ChromaDB", icon: "chromadb" },
   mariadb: { type: "mysql", port: 3306, user: "root", label: "MariaDB", icon: "mariadb" },
   tidb: { type: "mysql", port: 4000, user: "root", label: "TiDB", icon: "tidb" },
   oceanbase: { type: "mysql", port: 2881, user: "root", label: "OceanBase", icon: "oceanbase" },
@@ -514,6 +532,7 @@ const driverProfiles: Record<
   hive: { type: "hive", port: 10000, user: "", label: "Apache Hive", icon: "hive" },
   db2: { type: "db2", port: 50000, user: "db2inst1", label: "IBM DB2", icon: "db2" },
   informix: { type: "informix", port: 9088, user: "informix", label: "Informix", icon: "informix" },
+  dremio: { type: "jdbc", port: 31010, user: "", label: "Dremio", icon: "dremio" },
   neo4j: { type: "neo4j", port: 7687, user: "neo4j", label: "Neo4j", icon: "neo4j" },
   cassandra: { type: "cassandra", port: 9042, user: "cassandra", label: "Cassandra", icon: "cassandra" },
   bigquery: {
@@ -716,7 +735,7 @@ function isNacosAdminEndpointNotFound(message: string): boolean {
   return /Nacos admin endpoint was not found/i.test(message);
 }
 
-async function tryNacosDockerConsoleFallback(config: ConnectionConfig, originalError: string): Promise<string | null> {
+async function tryNacosDockerConsoleFallback(config: ConnectionConfig, originalError: string, runId: number): Promise<string | null> {
   if (config.db_type !== "nacos" || !isNacosAdminEndpointNotFound(originalError)) return null;
   const fallbackUrl = dockerNacosConsoleFallbackUrl(nacosServerAddr.value);
   if (!fallbackUrl || fallbackUrl === nacosServerAddr.value.trim()) return null;
@@ -725,11 +744,50 @@ async function tryNacosDockerConsoleFallback(config: ConnectionConfig, originalE
   nacosServerAddr.value = fallbackUrl;
   try {
     const fallbackConfig = connectionConfigForSubmit(config.id);
-    const message = await api.testConnection(fallbackConfig);
+    const message = await testConnectionWithTimeout(fallbackConfig, runId);
     return `${message} ${t("connection.nacosConsoleUrlAutoAdjusted", { from: previousUrl.trim(), to: fallbackUrl })}`;
   } catch {
     nacosServerAddr.value = previousUrl;
     return null;
+  }
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return String(error);
+}
+
+function connectionErrorWithDriverUpdateHint(config: ConnectionConfig, message: string): string {
+  if (!hasAgentDriverUpdate(config.db_type, agentDrivers.value, config.driver_profile)) return message;
+  return appendAgentDriverUpdateHint(message, t("connection.agentDriverUpdateConnectionHint"));
+}
+
+async function testConnectionWithTimeout(config: ConnectionConfig, runId: number): Promise<string> {
+  const timeoutMs = connectionAttemptTimeoutMs(config);
+  const timeoutMessage = connectionAttemptTimeoutMessage(timeoutMs);
+  const promise = api.testConnection(config);
+  let timedOut = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  void promise.catch((error) => {
+    if (!timedOut) return;
+    if (runId !== testRunId) return;
+    testResult.value = {
+      ok: false,
+      message: connectionErrorWithDriverUpdateHint(config, connectionAttemptOriginalErrorMessage(timeoutMessage, errorMessage(error))),
+    };
+  });
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<string>((_, reject) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          reject(new Error(timeoutMessage));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -757,6 +815,74 @@ function applyNacosServerAddr(config: LegacyConnectionConfig, serverAddr: string
   config.host = parsed.hostname;
   config.port = port;
   config.ssl = parsed.protocol === "https:";
+}
+
+function applyDremioConnectionMode(mode: DremioConnectionMode) {
+  rememberCurrentDremioConnectionUrl();
+  dremioConnectionMode.value = mode;
+  form.value.connection_string = dremioConnectionUrls.value[mode] || dremioDefaultConnectionUrl(mode);
+  if (isDremioGeneratedDefaultDriverClass(form.value.jdbc_driver_class)) {
+    form.value.jdbc_driver_class = dremioDefaultDriverClass(mode);
+  }
+}
+
+function rememberCurrentDremioConnectionUrl() {
+  if (form.value.driver_profile !== "dremio") return;
+  const url = form.value.connection_string?.trim();
+  dremioConnectionUrls.value[dremioConnectionMode.value] = url || dremioDefaultConnectionUrl();
+}
+
+function resetDremioConnectionUrls(mode: DremioConnectionMode = "legacy", url?: string) {
+  dremioConnectionUrls.value = {
+    "arrow-flight-sql": DREMIO_ARROW_FLIGHT_SQL_JDBC_URL,
+    legacy: DREMIO_LEGACY_JDBC_URL,
+  };
+  if (url?.trim()) {
+    dremioConnectionUrls.value[mode] = url.trim();
+  }
+}
+
+function dremioDefaultConnectionUrl(mode = dremioConnectionMode.value) {
+  return mode === "legacy" ? DREMIO_LEGACY_JDBC_URL : DREMIO_ARROW_FLIGHT_SQL_JDBC_URL;
+}
+
+function dremioDefaultDriverClass(mode = dremioConnectionMode.value) {
+  return mode === "legacy" ? DREMIO_LEGACY_JDBC_DRIVER_CLASS : DREMIO_ARROW_FLIGHT_SQL_JDBC_DRIVER_CLASS;
+}
+
+function isDremioGeneratedDefaultDriverClass(value: string | undefined) {
+  const driverClass = value?.trim() || "";
+  return !driverClass || driverClass === DREMIO_ARROW_FLIGHT_SQL_JDBC_DRIVER_CLASS || driverClass === DREMIO_LEGACY_JDBC_DRIVER_CLASS;
+}
+
+function restoreDremioConnectionDefaultsIfEmpty() {
+  if (form.value.driver_profile !== "dremio") return;
+  if (!form.value.connection_string?.trim()) {
+    form.value.connection_string = dremioDefaultConnectionUrl();
+  }
+  if (isDremioGeneratedDefaultDriverClass(form.value.jdbc_driver_class)) {
+    form.value.jdbc_driver_class = dremioDefaultDriverClass();
+  }
+}
+
+function syncDremioConnectionModeFromUrl() {
+  if (form.value.driver_profile !== "dremio") return;
+  restoreDremioConnectionDefaultsIfEmpty();
+  const nextMode = dremioConnectionModeForConfig({
+    connection_string: form.value.connection_string,
+    jdbc_driver_class: "",
+  });
+  dremioConnectionUrls.value[nextMode] = form.value.connection_string?.trim() || dremioDefaultConnectionUrl(nextMode);
+  if (nextMode === dremioConnectionMode.value) return;
+  dremioConnectionMode.value = nextMode;
+  if (isDremioGeneratedDefaultDriverClass(form.value.jdbc_driver_class)) {
+    form.value.jdbc_driver_class = dremioDefaultDriverClass(nextMode);
+  }
+}
+
+function dremioConnectionModeForConfig(config: Pick<ConnectionConfig, "connection_string" | "jdbc_driver_class">): DremioConnectionMode {
+  const haystack = `${config.connection_string || ""}\n${config.jdbc_driver_class || ""}`.toLowerCase();
+  return haystack.includes("jdbc:dremio:") || haystack.includes("com.dremio.jdbc.driver") ? "legacy" : "arrow-flight-sql";
 }
 
 function isCustomCompatibleProfile() {
@@ -794,6 +920,10 @@ function applyProfile(val: string, preserveConnectionFields = false) {
       form.value.jdbc_driver_class = "";
       form.value.jdbc_driver_paths = [];
       jdbcDriverPathsInput.value = "";
+      if (val === "dremio") {
+        resetDremioConnectionUrls();
+        applyDremioConnectionMode("legacy");
+      }
     }
     if (profile.type === "prestosql") {
       form.value.connection_string = undefined;
@@ -848,15 +978,17 @@ watch(
     if (config) {
       const legacyConfig = config as LegacyConnectionConfig;
       const profile = profileForConfig(config);
+      const oceanbaseMode = profile === "oceanbase" ? oceanbaseSubModeFromConfig(config) : "mysql";
+      const oceanbasePatch = profile === "oceanbase" ? oceanbaseModeConnectionPatch(oceanbaseMode) : null;
       editingId.value = config.id;
       const profileConfig = driverProfiles[profile];
       form.value = {
         name: config.name,
-        db_type: profileConfig?.type || config.db_type,
-        driver_profile: profile,
-        driver_label: config.driver_label || driverProfiles[profile]?.label || config.db_type,
+        db_type: oceanbasePatch?.db_type || profileConfig?.type || config.db_type,
+        driver_profile: oceanbasePatch?.driver_profile || profile,
+        driver_label: config.driver_label || oceanbasePatch?.driver_label || driverProfiles[profile]?.label || config.db_type,
         url_params: config.url_params || "",
-        host: config.db_type === "h2" ? config.host || h2FilePathFromJdbcUrl(config.connection_string) : config.host,
+        host: config.db_type === "h2" && h2FilePathFromJdbcUrl(config.connection_string) ? h2FilePathFromJdbcUrl(config.connection_string) : config.host,
         port: profile === "tdengine" && (config.port === 0 || config.port === 6030) ? 6041 : config.port,
         username: config.username,
         password: config.password,
@@ -866,7 +998,7 @@ watch(
         connect_timeout_secs: config.connect_timeout_secs || 10,
         query_timeout_secs: config.query_timeout_secs ?? 30,
         idle_timeout_secs: config.idle_timeout_secs ?? 60,
-        keepalive_interval_secs: config.keepalive_interval_secs ?? 0,
+        keepalive_interval_secs: config.keepalive_interval_secs ?? 30,
         ssl: config.ssl || false,
         ca_cert_path: config.ca_cert_path || "",
         client_cert_path: config.client_cert_path || "",
@@ -884,11 +1016,14 @@ watch(
         redis_sentinel_tls: config.redis_sentinel_tls || false,
         redis_cluster_nodes: config.redis_cluster_nodes || "",
         redis_key_separator: config.redis_key_separator ?? ":",
+        redis_scan_page_size: config.redis_scan_page_size ?? REDIS_SCAN_PAGE_SIZE_DEFAULT,
         etcd_endpoints: config.etcd_endpoints || "",
         informix_server: config.informix_server || "",
         read_only: config.read_only || false,
         visible_databases: config.visible_databases,
       };
+      connectionUrlInput.value = config.db_type === "h2" && config.connection_string ? config.connection_string : "";
+      appliedConnectionUrlInput.value = connectionUrlInput.value.trim();
       if (config.db_type === "mq") {
         hydrateMqFields(config.external_config);
       } else {
@@ -904,11 +1039,13 @@ watch(
       selectedTransportLayerId.value = form.value.transport_layers?.[0]?.id || null;
       selectedType.value = profile;
       if (profile === "oceanbase") {
-        oceanbaseSubMode.value = config.driver_profile === "oceanbase-oracle" ? "oracle" : "mysql";
+        oceanbaseSubMode.value = oceanbaseMode;
       }
       if (profile === "gbase8a" || profile === "gbase8s") {
         selectedType.value = "gbase";
       }
+      dremioConnectionMode.value = profile === "dremio" ? dremioConnectionModeForConfig(config) : "legacy";
+      resetDremioConnectionUrls(dremioConnectionMode.value, profile === "dremio" ? config.connection_string : undefined);
       mongoUseUrl.value = !!config.connection_string;
       jdbcDriverPathsInput.value = (config.jdbc_driver_paths || []).join("\n");
       jdbcManualClasspathOpen.value = config.db_type === "prestosql" || (config.jdbc_driver_paths || []).length > 0;
@@ -925,6 +1062,8 @@ watch(
       resetNacosFields();
       oceanbaseSubMode.value = "mysql";
       h2ConnectionMode.value = "file";
+      dremioConnectionMode.value = "legacy";
+      resetDremioConnectionUrls();
       dialogStep.value = "select";
       configTab.value = "connection";
     }
@@ -1026,6 +1165,7 @@ const iconTypeMap: Record<string, string> = {
   qdrant: "qdrant",
   milvus: "milvus",
   weaviate: "weaviate",
+  chromadb: "chromadb",
   mariadb: "mariadb",
   tidb: "tidb",
   oceanbase: "oceanbase",
@@ -1071,6 +1211,7 @@ const iconTypeMap: Record<string, string> = {
   hive: "hive",
   db2: "db2",
   informix: "informix",
+  dremio: "dremio",
   iris: "iris",
   neo4j: "neo4j",
   cassandra: "cassandra",
@@ -1095,6 +1236,7 @@ const dbOptions: DbOption[] = [
   { value: "qdrant", label: "Qdrant" },
   { value: "milvus", label: "Milvus" },
   { value: "weaviate", label: "Weaviate" },
+  { value: "chromadb", label: "ChromaDB" },
   { value: "dm", label: "DM (Dameng)" },
   { value: "opengauss", label: "openGauss" },
   { value: "turso", label: "Turso" },
@@ -1154,6 +1296,7 @@ const dbOptions: DbOption[] = [
   { value: "manticoresearch", label: "Manticore Search" },
   { value: "custom_mysql", label: "Custom (MySQL)" },
   { value: "custom_postgres", label: "Custom (PostgreSQL)" },
+  { value: "dremio", label: "Dremio" },
 ];
 
 const dbCategories = computed<DbCategory[]>(() => [{ key: "all", title: "", options: dbOptions }]);
@@ -1188,6 +1331,7 @@ const isH2FileMode = computed(() => form.value.db_type === "h2" && h2ConnectionM
 const usesLocalFilePathInput = computed(() => isLocalFileTypeDb(form.value.db_type) && (form.value.db_type !== "h2" || isH2FileMode.value));
 
 const connectionUrlPlaceholder = computed(() => getUrlPlaceholder(form.value.db_type));
+const jdbcUsernamePlaceholder = computed(() => (form.value.driver_profile === "dremio" ? "" : "sa"));
 const filePathPlaceholder = computed(() => {
   if (form.value.db_type === "duckdb") return "/path/to/database.duckdb or :memory:";
   if (form.value.db_type === "access") return "/path/to/database.accdb";
@@ -1201,7 +1345,7 @@ const sqliteExtensionPaths = computed({
     form.value.url_params = setSqliteExtensionPaths(form.value.url_params, value);
   },
 });
-const tlsCapableDatabaseTypes = new Set<DatabaseType>(["mysql", "postgres", "redshift", "gaussdb", "kwdb", "opengauss", "questdb", "redis", "etcd", "clickhouse", "elasticsearch", "qdrant", "milvus", "weaviate", "influxdb"]);
+const tlsCapableDatabaseTypes = new Set<DatabaseType>(["mysql", "postgres", "redshift", "gaussdb", "kwdb", "opengauss", "questdb", "redis", "etcd", "clickhouse", "elasticsearch", "qdrant", "milvus", "weaviate", "chromadb", "influxdb"]);
 const supportsTlsToggle = computed(() => tlsCapableDatabaseTypes.has(form.value.db_type));
 const supportsCaCertificatePath = computed(() => form.value.db_type === "clickhouse");
 const supportsGenericUrlParams = computed(() => form.value.db_type !== "manticoresearch");
@@ -1281,6 +1425,7 @@ const canUseTransportLayers = computed(() => form.value.db_type !== "sqlite" && 
 const shouldShowAgentDriverInstallHint = computed(() => showAgentDriverInstallHint(form.value.db_type, agentDrivers.value, form.value.driver_profile));
 const h2DriverMissing = computed(() => form.value.db_type === "h2" && isH2FileMode.value && agentDrivers.value.find((d) => d.db_type === "h2")?.installed !== true);
 const canChooseVisibleDatabases = computed(() => connectionCanChooseVisibleDatabases(form.value));
+const visibleFilterUsesSchemas = computed(() => connectionUsesVisibleSchemaFilter(form.value));
 const hasVisibleDatabaseFilter = computed(() => Array.isArray(form.value.visible_databases));
 const visibleDatabaseSummary = computed(() => {
   const configured = form.value.visible_databases;
@@ -1288,6 +1433,7 @@ const visibleDatabaseSummary = computed(() => {
   return t("visibleDatabases.selectedCount", { selected: configured.length, total: visibleDatabaseNames.value.length });
 });
 const listedVisibleDatabaseNames = computed(() => {
+  if (visibleFilterUsesSchemas.value) return visibleDatabaseNames.value;
   const connection = connectionConfigSnapshotForVisibleDatabases();
   if (visibleDatabaseShowSystem.value) return visibleDatabaseNames.value;
   return filterDatabaseNamesForConnection(visibleDatabaseNames.value, connection);
@@ -1301,6 +1447,7 @@ const visibleDatabaseSelectedCount = computed(() => visibleDatabaseSelection.val
 const visibleDatabaseTotalCount = computed(() => listedVisibleDatabaseNames.value.length);
 const visibleDatabaseCanSave = computed(() => canSaveVisibleDatabaseSelection([...visibleDatabaseSelection.value]));
 const visibleDatabaseHasSystemDatabases = computed(() => {
+  if (visibleFilterUsesSchemas.value) return false;
   const connection = connectionConfigSnapshotForVisibleDatabases();
   return visibleDatabaseNames.value.some((database) => isSystemDatabaseName(connection.db_type, database));
 });
@@ -1310,16 +1457,45 @@ const hasVisibleSchemaFilter = computed(() => {
   const key = visibleSchemasDatabaseKey.value;
   return Array.isArray(form.value.visible_schemas?.[key]);
 });
+const visibleSchemaObjectSelection = computed(() => {
+  const configured = form.value.visible_schemas?.[visibleSchemasDatabaseKey.value];
+  if (Array.isArray(configured)) return configured;
+  if (visibleFilterUsesSchemas.value && Array.isArray(form.value.visible_databases)) return form.value.visible_databases;
+  return undefined;
+});
 const visibleSchemaSummary = computed(() => {
   const key = visibleSchemasDatabaseKey.value;
   const configured = form.value.visible_schemas?.[key];
-  if (!configured?.length) return t("visibleSchemas.showAll");
+  if (!Array.isArray(configured)) return t("visibleSchemas.showAll");
   return t("visibleSchemas.selectedCount", { selected: configured.length, total: visibleSchemaNames.value.length });
 });
+const hasVisibleObjectFilter = computed(() => (visibleFilterUsesSchemas.value ? Array.isArray(visibleSchemaObjectSelection.value) : hasVisibleDatabaseFilter.value));
+const visibleObjectSummary = computed(() => {
+  if (!visibleFilterUsesSchemas.value) return visibleDatabaseSummary.value;
+  const configured = visibleSchemaObjectSelection.value;
+  if (!Array.isArray(configured)) return t("visibleSchemas.showAll");
+  return t("visibleSchemas.selectedCount", { selected: configured.length, total: visibleDatabaseNames.value.length });
+});
+const visibleObjectTitleKey = computed(() => (visibleFilterUsesSchemas.value ? "visibleSchemas.title" : "visibleDatabases.title"));
+const visibleObjectDescriptionKey = computed(() => (visibleFilterUsesSchemas.value ? "visibleSchemas.description" : "visibleDatabases.description"));
+const visibleObjectSearchPlaceholderKey = computed(() => (visibleFilterUsesSchemas.value ? "visibleSchemas.searchPlaceholder" : "visibleDatabases.searchPlaceholder"));
+const visibleObjectSelectedCountKey = computed(() => (visibleFilterUsesSchemas.value ? "visibleSchemas.selectedCount" : "visibleDatabases.selectedCount"));
+const visibleObjectEmptySelectionKey = computed(() => (visibleFilterUsesSchemas.value ? "visibleSchemas.emptySelection" : "visibleDatabases.emptySelection"));
+const visibleObjectLoadFailedKey = computed(() => (visibleFilterUsesSchemas.value ? "visibleSchemas.loadFailed" : "visibleDatabases.loadFailed"));
+const visibleObjectSaveKey = computed(() => (visibleFilterUsesSchemas.value ? "visibleSchemas.save" : "visibleDatabases.save"));
 const testResultMessage = computed(() => {
   if (!testResult.value) return "";
-  return testResult.value.ok ? t("connection.testSuccess") : testResult.value.message;
+  return testResult.value.ok ? t("connection.testSuccess") : translateBackendError(t, testResult.value.message);
 });
+const shouldUseWideConnectionDialog = computed(() => dialogStep.value === "config" && (canChooseVisibleDatabases.value || (canChooseVisibleSchemas.value && !visibleFilterUsesSchemas.value)));
+const connectionDialogContentClass = computed(() => {
+  if (dialogStep.value === "select") return "sm:max-w-[760px]";
+  return shouldUseWideConnectionDialog.value ? "sm:max-w-[660px]" : "sm:max-w-[560px]";
+});
+const connectionLabelClass = "justify-self-start text-left";
+const connectionLabelSmallClass = `${connectionLabelClass} text-xs`;
+const connectionLabelTopClass = `${connectionLabelClass} mt-2`;
+const connectionLabelSmallPaddedClass = `${connectionLabelClass} pt-2 text-xs`;
 const hasRequiredConnectionTarget = computed(() => {
   if (form.value.db_type === "mq") return !!mqAdminUrl.value.trim();
   if (form.value.db_type === "zookeeper") return !!(form.value.host || form.value.connection_string || connectionUrlInput.value.trim());
@@ -1375,7 +1551,7 @@ async function testConnection() {
   testResult.value = null;
   const config = connectionConfigForSubmit(editingId.value || uuid());
   try {
-    const msg = await api.testConnection(config);
+    const msg = await testConnectionWithTimeout(config, runId);
     if (runId !== testRunId) return;
     if (config.db_type === "mongodb" && /legacy driver/i.test(msg)) {
       mongoDriverMode.value = "legacy";
@@ -1383,8 +1559,8 @@ async function testConnection() {
     testResult.value = { ok: true, message: msg };
   } catch (e: any) {
     if (runId !== testRunId) return;
-    const message = mongodbAuthFailureHint(String(e));
-    const fallbackMessage = await tryNacosDockerConsoleFallback(config, message);
+    const message = connectionErrorWithDriverUpdateHint(config, mongodbAuthFailureHint(String(e)));
+    const fallbackMessage = await tryNacosDockerConsoleFallback(config, message, runId);
     if (runId !== testRunId) return;
     testResult.value = fallbackMessage ? { ok: true, message: fallbackMessage } : { ok: false, message };
   } finally {
@@ -1396,15 +1572,27 @@ async function testConnection() {
 
 function applyConnectionUrlToForm(input: string): boolean {
   try {
+    const draft = parseConnectionDeepLink(input);
+    if (draft) {
+      applyConnectionDraftToForm({ ...draft, oneTime: undefined });
+      resetTestState();
+      appliedConnectionUrlInput.value = input.trim();
+      return true;
+    }
+
     const parsed = parseConnectionUrl(input, selectedType.value);
     form.value = applyParsedConnectionUrl(form.value, parsed);
     selectedType.value = parsed.driverProfile;
     customDriverName.value = isCustomCompatibleProfile() ? parsed.driverLabel : "";
     mongoUseUrl.value = !!parsed.useMongoUrl;
+    if (form.value.db_type === "h2") {
+      h2ConnectionMode.value = h2ConnectionModeForConfig(form.value);
+    }
     if (!form.value.name.trim()) {
       form.value.name = parsed.database || parsed.host || parsed.driverLabel;
     }
     resetTestState();
+    appliedConnectionUrlInput.value = input.trim();
     return true;
   } catch (e: any) {
     toast(t("connection.parseConnectionUrlFailed", { message: e?.message || String(e) }), 5000);
@@ -1412,11 +1600,103 @@ function applyConnectionUrlToForm(input: string): boolean {
   }
 }
 
-function ensureConnectionHostResolvedFromUrl(): boolean {
-  if (form.value.host.trim()) return true;
+function hasPendingConnectionUrlInput(): boolean {
   const url = connectionUrlInput.value.trim();
-  if (!url) return true;
-  return applyConnectionUrlToForm(url);
+  return !!url && url !== appliedConnectionUrlInput.value;
+}
+
+function ensureConnectionHostResolvedFromUrl(): boolean {
+  if (!hasPendingConnectionUrlInput()) return true;
+  return applyConnectionUrlToForm(connectionUrlInput.value.trim());
+}
+
+function formValueForSubmit(): Omit<ConnectionConfig, "id"> {
+  const url = connectionUrlInput.value.trim();
+  if (!url || url === appliedConnectionUrlInput.value) return form.value;
+
+  const draft = parseConnectionDeepLink(url);
+  if (draft) {
+    return applyConnectionDraftToConfig(form.value, { ...draft, oneTime: undefined });
+  }
+
+  return applyParsedConnectionUrl(form.value, parseConnectionUrl(url, selectedType.value));
+}
+
+function applyDremioJdbcMetadata(config: LegacyConnectionConfig) {
+  config.connection_string = config.connection_string?.trim() || dremioDefaultConnectionUrl();
+  try {
+    const parsed = parseConnectionUrl(config.connection_string);
+    if (parsed.driverProfile !== "dremio") return;
+    config.host = parsed.host;
+    config.port = parsed.port;
+    config.database = config.database?.trim() || parsed.database;
+    config.connection_string = dremioConnectionStringForSubmit(config.connection_string, config.url_params, config.database);
+    config.url_params = "";
+    if (!config.username) config.username = parsed.username;
+    if (!config.password) config.password = parsed.password;
+  } catch {
+    // Keep custom JDBC input editable; the agent will surface driver-specific URL errors.
+  }
+}
+
+function dremioConnectionStringForSubmit(connectionString: string, urlParams: string | undefined, database: string | undefined) {
+  const params = dremioSubmitUrlParams(connectionString, urlParams, database);
+  if (!params) return connectionString;
+  return `${connectionString}${dremioSubmitUrlParamSeparator(connectionString)}${params}`;
+}
+
+function dremioSubmitUrlParams(connectionString: string | undefined, urlParams: string | undefined, database: string | undefined) {
+  const existingKeys = dremioUrlParamKeys(connectionString || "");
+  const extraParams = filterDremioUrlParams(urlParams || "", existingKeys);
+  if (database?.trim() && !existingKeys.has("schema") && !dremioUrlParamKeys(extraParams.join("&")).has("schema")) {
+    extraParams.push(`schema=${database.trim()}`);
+  }
+  return extraParams.join(dremioConnectionStringUsesLegacyUrlParams(connectionString || "") ? ";" : "&");
+}
+
+function dremioSubmitUrlParamSeparator(connectionString: string) {
+  if (dremioConnectionStringUsesLegacyUrlParams(connectionString)) {
+    return connectionString.endsWith(";") ? "" : ";";
+  }
+  return connectionString.includes("?") ? (connectionString.endsWith("?") || connectionString.endsWith("&") ? "" : "&") : "?";
+}
+
+function dremioConnectionStringUsesLegacyUrlParams(connectionString: string) {
+  if (/^jdbc:dremio:/i.test(connectionString)) return true;
+  if (/^jdbc:arrow-flight-sql:\/\//i.test(connectionString)) return false;
+  return dremioConnectionMode.value === "legacy";
+}
+
+function filterDremioUrlParams(urlParams: string, existingKeys: Set<string>) {
+  const result: string[] = [];
+  for (const part of urlParams.split(/[&;]/)) {
+    const param = part.trim();
+    if (!param) continue;
+    const key = param.split("=")[0]?.trim().toLowerCase();
+    if (!key || existingKeys.has(key)) continue;
+    result.push(param);
+  }
+  return result;
+}
+
+function dremioUrlParamKeys(value: string) {
+  const keys = new Set<string>();
+  const params = dremioUrlParamString(value);
+  for (const part of params.split(/[&;]/)) {
+    const key = part.split("=")[0]?.trim().toLowerCase();
+    if (key) keys.add(key);
+  }
+  return keys;
+}
+
+function dremioUrlParamString(value: string) {
+  if (/^jdbc:dremio:/i.test(value)) {
+    return value.split(";").slice(1).join(";");
+  }
+  const queryStart = value.indexOf("?");
+  if (queryStart < 0) return value;
+  const fragmentStart = value.indexOf("#", queryStart + 1);
+  return value.slice(queryStart + 1, fragmentStart < 0 ? undefined : fragmentStart);
 }
 
 function generateConnectionName(): string {
@@ -1426,7 +1706,10 @@ function generateConnectionName(): string {
 }
 
 function connectionConfigForSubmit(id: string): ConnectionConfig {
-  const config = { ...form.value, id } as LegacyConnectionConfig;
+  const config = { ...formValueForSubmit(), id } as LegacyConnectionConfig;
+  if (selectedType.value === "oceanbase" && (config.driver_profile === "oceanbase" || config.driver_profile === "oceanbase-oracle")) {
+    Object.assign(config, oceanbaseModeConnectionPatch(oceanbaseSubMode.value));
+  }
   if (!config.name?.trim()) {
     config.name = generateConnectionName();
   }
@@ -1446,7 +1729,7 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
   const idleTimeout = Number(config.idle_timeout_secs);
   config.idle_timeout_secs = Number.isFinite(idleTimeout) && idleTimeout >= 0 ? idleTimeout : 60;
   const keepaliveInterval = Number(config.keepalive_interval_secs);
-  config.keepalive_interval_secs = Number.isFinite(keepaliveInterval) && keepaliveInterval >= 0 ? keepaliveInterval : 0;
+  config.keepalive_interval_secs = Number.isFinite(keepaliveInterval) && keepaliveInterval >= 0 ? keepaliveInterval : 30;
   if (config.db_type === "manticoresearch") {
     config.url_params = "";
   }
@@ -1505,6 +1788,7 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
     config.redis_sentinel_tls = undefined;
     config.redis_cluster_nodes = undefined;
     config.redis_key_separator = undefined;
+    config.redis_scan_page_size = undefined;
   } else if (config.redis_connection_mode === "sentinel") {
     config.redis_sentinel_master = config.redis_sentinel_master?.trim() || "";
     config.redis_sentinel_nodes = normalizeRedisSentinelNodes(config.redis_sentinel_nodes || "");
@@ -1538,6 +1822,8 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
   }
   if (config.db_type === "redis") {
     config.redis_key_separator = config.redis_key_separator?.trim() ?? ":";
+    const scanSize = Number(config.redis_scan_page_size);
+    config.redis_scan_page_size = Number.isFinite(scanSize) && scanSize >= REDIS_SCAN_PAGE_SIZE_MIN && scanSize <= REDIS_SCAN_PAGE_SIZE_MAX ? Math.round(scanSize) : REDIS_SCAN_PAGE_SIZE_DEFAULT;
   }
   if (config.db_type === "zookeeper") {
     const normalizedConnectString = normalizeZooKeeperConnectString(config.connection_string || "");
@@ -1575,9 +1861,13 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
   }
   if (jdbcBackedDatabaseTypes.has(config.db_type)) {
     if (config.db_type === "jdbc") {
-      config.host = "";
-      config.port = 0;
-      config.connection_string = config.connection_string?.trim() || "";
+      if (config.driver_profile === "dremio") {
+        applyDremioJdbcMetadata(config);
+      } else {
+        config.host = "";
+        config.port = 0;
+        config.connection_string = config.connection_string?.trim() || "";
+      }
     } else if (config.db_type === "prestosql") {
       config.connection_string = undefined;
       config.jdbc_driver_class = config.jdbc_driver_class?.trim() || "io.prestosql.jdbc.PrestoDriver";
@@ -1590,14 +1880,16 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
       .filter(Boolean);
   }
   if (config.db_type === "h2") {
-    if (h2ConnectionMode.value === "file") {
-      const filePath = config.host?.trim() || h2FilePathFromJdbcUrl(config.connection_string);
+    const h2Mode = connectionUrlInput.value.trim() ? h2ConnectionModeForConfig(config) : h2ConnectionMode.value;
+    if (h2Mode === "file") {
+      const jdbcFilePath = h2FilePathFromJdbcUrl(config.connection_string);
+      const filePath = config.host?.trim() || jdbcFilePath || "";
       if (!filePath) {
         throw new Error(t("connection.h2FilePathRequired"));
       }
       config.host = filePath;
       config.port = 0;
-      config.connection_string = h2FileJdbcUrl(filePath);
+      config.connection_string = isH2SplitJdbcUrl(config.connection_string) ? h2FileJdbcUrlWithPath(config.connection_string, filePath) : h2FileJdbcUrlWithPath(undefined, filePath);
       config.transport_layers = [];
     } else {
       config.host = config.host?.trim() || "127.0.0.1";
@@ -1626,7 +1918,11 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
   delete legacy.proxy_port;
   delete legacy.proxy_username;
   delete legacy.proxy_password;
-  config.visible_databases = Array.isArray(config.visible_databases) && config.visible_databases.length > 0 ? config.visible_databases : undefined;
+  if (connectionUsesVisibleSchemaFilter(config)) {
+    config.visible_databases = undefined;
+  } else {
+    config.visible_databases = Array.isArray(config.visible_databases) && config.visible_databases.length > 0 ? config.visible_databases : undefined;
+  }
   if (config.visible_schemas && Object.keys(config.visible_schemas).length === 0) config.visible_schemas = undefined;
   return config as ConnectionConfig;
 }
@@ -1894,9 +2190,10 @@ async function openVisibleDatabasesPicker() {
     await api.connectDb(draftConfig);
     const names = await loadVisibleDatabaseNames(draftId, draftConfig);
     visibleDatabaseNames.value = names;
-    const initialSelection = initialVisibleDatabaseSelection(names, form.value.visible_databases, draftConfig);
+    const configuredSchemas = visibleSchemaObjectSelection.value;
+    const initialSelection = visibleFilterUsesSchemas.value ? (Array.isArray(configuredSchemas) ? normalizeVisibleSchemaSelection(configuredSchemas, names) : names) : initialVisibleDatabaseSelection(names, form.value.visible_databases, draftConfig);
     visibleDatabaseSelection.value = new Set(initialSelection);
-    visibleDatabaseShowSystem.value = initialSelection.some((database) => isSystemDatabaseName(draftConfig.db_type, database));
+    visibleDatabaseShowSystem.value = !visibleFilterUsesSchemas.value && initialSelection.some((database) => isSystemDatabaseName(draftConfig.db_type, database));
     showVisibleDatabasesDialog.value = true;
   } catch (e: any) {
     visibleDatabaseNames.value = [];
@@ -1910,7 +2207,7 @@ async function openVisibleDatabasesPicker() {
 }
 
 async function loadVisibleDatabaseNames(connectionId: string, config: ConnectionConfig): Promise<string[]> {
-  if (config.db_type === "oracle" || config.db_type === "dameng") {
+  if (connectionUsesVisibleSchemaFilter(config)) {
     return api.listSchemas(connectionId, config.database || "");
   }
   if (config.db_type === "redis") {
@@ -1938,7 +2235,12 @@ function clearVisibleDatabaseSelection() {
 }
 
 function showAllVisibleDatabases() {
-  form.value.visible_databases = undefined;
+  if (visibleFilterUsesSchemas.value) {
+    handleDraftSchemasShowAll();
+    form.value.visible_databases = undefined;
+  } else {
+    form.value.visible_databases = undefined;
+  }
   visibleDatabaseSelection.value = new Set();
   visibleDatabaseNames.value = [];
   showVisibleDatabasesDialog.value = false;
@@ -1946,7 +2248,16 @@ function showAllVisibleDatabases() {
 
 function saveVisibleDatabaseSelection() {
   if (!visibleDatabaseCanSave.value) return;
-  form.value.visible_databases = normalizeVisibleDatabaseSelection([...visibleDatabaseSelection.value], visibleDatabaseNames.value);
+  if (visibleFilterUsesSchemas.value) {
+    const key = visibleSchemasDatabaseKey.value;
+    form.value.visible_databases = undefined;
+    form.value.visible_schemas = {
+      ...form.value.visible_schemas,
+      [key]: normalizeVisibleSchemaSelection([...visibleDatabaseSelection.value], visibleDatabaseNames.value),
+    };
+  } else {
+    form.value.visible_databases = normalizeVisibleDatabaseSelection([...visibleDatabaseSelection.value], visibleDatabaseNames.value);
+  }
   showVisibleDatabasesDialog.value = false;
 }
 
@@ -1989,7 +2300,7 @@ async function openVisibleSchemasPicker() {
 
 function handleDraftSchemasSave(selectedNames: string[]) {
   const key = visibleSchemasDatabaseKey.value;
-  form.value.visible_schemas = { ...(form.value.visible_schemas || {}), [key]: selectedNames };
+  form.value.visible_schemas = { ...form.value.visible_schemas, [key]: selectedNames };
 }
 
 function handleDraftSchemasShowAll() {
@@ -2027,9 +2338,12 @@ function resetForm() {
   mongoUseUrl.value = false;
   resetMqFields();
   oceanbaseSubMode.value = "mysql";
+  dremioConnectionMode.value = "legacy";
+  resetDremioConnectionUrls();
   jdbcDriverPathsInput.value = "";
   selectedJdbcDriverPath.value = "";
   connectionUrlInput.value = "";
+  appliedConnectionUrlInput.value = "";
   dialogStep.value = "select";
   dbPickerView.value = "icon";
   dbSearchQuery.value = "";
@@ -2053,26 +2367,32 @@ function submitOneTimePrefill(draft: ConnectionDeepLinkDraft) {
   void nextTick(() => save());
 }
 
-function applyConnectionPrefill(draft: ConnectionDeepLinkDraft) {
-  resetForm();
-  applyProfile(draft.driverProfile);
-  form.value = {
-    ...form.value,
+function applyConnectionDraftToConfig(config: Omit<ConnectionConfig, "id">, draft: ConnectionDeepLinkDraft): Omit<ConnectionConfig, "id"> {
+  return {
+    ...config,
     db_type: draft.dbType,
     driver_profile: draft.driverProfile,
     driver_label: draft.driverLabel,
-    host: draft.host ?? form.value.host,
-    port: draft.port ?? form.value.port,
-    username: draft.username ?? form.value.username,
-    password: draft.password ?? form.value.password,
-    database: draft.database ?? form.value.database,
-    url_params: draft.urlParams ?? form.value.url_params,
-    ssl: draft.ssl ?? form.value.ssl,
-    connection_string: draft.connectionString ?? form.value.connection_string,
-    oracle_connection_type: draft.oracleConnectionType ?? form.value.oracle_connection_type,
+    host: draft.host ?? config.host,
+    port: draft.port ?? config.port,
+    username: draft.username ?? config.username,
+    password: draft.password ?? config.password,
+    database: draft.database ?? config.database,
+    url_params: draft.urlParams ?? config.url_params,
+    ssl: draft.ssl ?? config.ssl,
+    connection_string: draft.connectionString ?? config.connection_string,
+    oracle_connection_type: draft.oracleConnectionType ?? config.oracle_connection_type,
     one_time: draft.oneTime || undefined,
   };
+}
+
+function applyConnectionDraftToForm(draft: ConnectionDeepLinkDraft) {
+  applyProfile(draft.driverProfile);
+  form.value = applyConnectionDraftToConfig(form.value, draft);
   selectedType.value = draft.driverProfile;
+  if (form.value.db_type === "h2") {
+    h2ConnectionMode.value = h2ConnectionModeForConfig(form.value);
+  }
   if (draft.driverProfile === "oceanbase-oracle") {
     oceanbaseSubMode.value = "oracle";
     selectedType.value = "oceanbase";
@@ -2090,6 +2410,11 @@ function applyConnectionPrefill(draft: ConnectionDeepLinkDraft) {
   dialogStep.value = "config";
   configTab.value = "connection";
   resetTestState();
+}
+
+function applyConnectionPrefill(draft: ConnectionDeepLinkDraft) {
+  resetForm();
+  applyConnectionDraftToForm(draft);
   submitOneTimePrefill(draft);
 }
 
@@ -2244,7 +2569,7 @@ function validateTransportLayers(config: LegacyConnectionConfig) {
       throw new Error(t("connection.sshHopInvalidPort", { hop: label }));
     }
     if (layer.type === "ssh") {
-      if (!layer.user?.trim()) throw new Error(t("connection.sshHopInvalidUser", { hop: label }));
+      layer.user = layer.user?.trim() || DEFAULT_SSH_USER;
       // Auth credentials are optional: the backend probes "none" authentication
       // first, so hops that require no credential (e.g. passwordless SSH proxies)
       // are valid with password, key, and agent all left empty.
@@ -2449,6 +2774,13 @@ async function createDuckDbFilePath() {
 
   const path = ensureDuckDbFileExtension(selected);
   form.value.host = path;
+
+  try {
+    const { writeTextFile } = await import("@tauri-apps/plugin-fs");
+    await writeTextFile(path, "");
+  } catch (e) {
+    console.error("Failed to create DuckDB file:", e);
+  }
 }
 
 function ensureSqliteFileExtension(path: string): string {
@@ -2468,6 +2800,13 @@ async function createSqliteFilePath() {
 
   const path = ensureSqliteFileExtension(selected);
   form.value.host = path;
+
+  try {
+    const { writeTextFile } = await import("@tauri-apps/plugin-fs");
+    await writeTextFile(path, "");
+  } catch (e) {
+    console.error("Failed to create SQLite file:", e);
+  }
 }
 
 async function browseJdbcDriverPaths() {
@@ -2556,7 +2895,7 @@ function openExternalUrl(url: string) {
 
 <template>
   <Dialog v-model:open="open">
-    <DialogContent :class="dialogStep === 'select' ? 'sm:max-w-[760px]' : 'sm:max-w-[560px]'" @interact-outside.prevent>
+    <DialogContent class="connection-dialog-content" :class="connectionDialogContentClass" :data-wide="shouldUseWideConnectionDialog ? 'true' : undefined" @interact-outside.prevent>
       <DialogHeader>
         <DialogTitle>{{ editingId ? t("connection.editTitle") : t("connection.title") }}</DialogTitle>
       </DialogHeader>
@@ -2653,9 +2992,9 @@ function openExternalUrl(url: string) {
             </div>
 
             <TabsContent value="connection" class="m-0">
-              <div class="grid gap-4 py-4 pr-2 max-h-[65vh] overflow-y-auto">
+              <div class="connection-form-body grid gap-4 py-4 pr-2 max-h-[65vh] overflow-y-auto">
                 <div v-if="!isJdbcConnection" class="grid grid-cols-4 items-center gap-4">
-                  <Label class="text-right">{{ t("connection.connectionUrlOptional") }}</Label>
+                  <Label :class="connectionLabelClass">{{ t("connection.connectionUrlOptional") }}</Label>
                   <div class="col-span-3 flex items-center gap-1">
                     <Input v-model="connectionUrlInput" class="flex-1" :placeholder="connectionUrlPlaceholder" @keydown.enter.prevent="applyConnectionUrl" />
                     <Tooltip>
@@ -2670,12 +3009,12 @@ function openExternalUrl(url: string) {
                 </div>
 
                 <div class="grid grid-cols-4 items-center gap-4">
-                  <Label class="text-right">{{ t("connection.name") }}</Label>
+                  <Label :class="connectionLabelClass">{{ t("connection.name") }}</Label>
                   <Input v-model="form.name" class="col-span-3" :placeholder="t('connection.namePlaceholder')" />
                 </div>
 
                 <div class="grid grid-cols-4 items-center gap-4">
-                  <Label class="text-right">{{ t("connection.type") }}</Label>
+                  <Label :class="connectionLabelClass">{{ t("connection.type") }}</Label>
                   <button type="button" class="col-span-3 flex items-center gap-2 rounded-md border bg-muted/20 px-3 py-2 hover:bg-muted/40 cursor-pointer transition" @click="backToDatabasePicker()">
                     <DatabaseIcon :db-type="selectedDbIcon" class="h-4 w-4 shrink-0" />
                     <span class="min-w-0 flex-1 truncate text-sm text-left">{{ selectedProfile().label }}</span>
@@ -2685,7 +3024,7 @@ function openExternalUrl(url: string) {
 
                 <!-- OceanBase mode toggle -->
                 <div v-if="selectedType === 'oceanbase'" class="grid grid-cols-4 items-center gap-4">
-                  <Label class="text-right text-xs">{{ t("connection.mode") }}</Label>
+                  <Label :class="connectionLabelSmallClass">{{ t("connection.mode") }}</Label>
                   <div class="col-span-3 flex gap-2">
                     <Button size="sm" :variant="oceanbaseSubMode === 'mysql' ? 'default' : 'outline'" @click="switchOceanbaseMode('mysql')">
                       {{ t("connection.oceanbaseMySQLMode") }}
@@ -2697,7 +3036,7 @@ function openExternalUrl(url: string) {
                 </div>
 
                 <div v-if="selectedType === 'gbase'" class="grid grid-cols-4 items-center gap-4">
-                  <Label class="text-right text-xs">{{ t("connection.version") }}</Label>
+                  <Label :class="connectionLabelSmallClass">{{ t("connection.version") }}</Label>
                   <div class="col-span-3 flex gap-2">
                     <Button size="sm" :variant="form.driver_profile === 'gbase8s' ? 'outline' : 'default'" @click="switchGbaseProfile('gbase8a')"> GBase 8a </Button>
                     <Button size="sm" :variant="form.driver_profile === 'gbase8s' ? 'default' : 'outline'" @click="switchGbaseProfile('gbase8s')"> GBase 8s </Button>
@@ -2705,12 +3044,12 @@ function openExternalUrl(url: string) {
                 </div>
 
                 <div v-if="isCustomCompatibleProfile()" class="grid grid-cols-4 items-center gap-4">
-                  <Label class="text-right">{{ t("connection.driverName") }}</Label>
+                  <Label :class="connectionLabelClass">{{ t("connection.driverName") }}</Label>
                   <Input v-model="customDriverName" class="col-span-3" :placeholder="t('connection.driverNamePlaceholder')" />
                 </div>
 
                 <div class="grid grid-cols-4 items-center gap-4">
-                  <Label class="text-right">{{ t("connection.color") }}</Label>
+                  <Label :class="connectionLabelClass">{{ t("connection.color") }}</Label>
                   <div class="col-span-3 flex items-center gap-1.5">
                     <button
                       v-for="color in colorOptions"
@@ -2744,7 +3083,7 @@ function openExternalUrl(url: string) {
                 </div>
 
                 <div v-if="form.db_type === 'h2'" class="grid grid-cols-4 items-center gap-4">
-                  <Label class="text-right text-xs">{{ t("connection.mode") }}</Label>
+                  <Label :class="connectionLabelSmallClass">{{ t("connection.mode") }}</Label>
                   <div class="col-span-3 flex gap-2">
                     <Button size="sm" :variant="h2ConnectionMode === 'file' ? 'default' : 'outline'" @click="switchH2ConnectionMode('file')">
                       {{ t("connection.h2FileMode") }}
@@ -2765,20 +3104,31 @@ function openExternalUrl(url: string) {
 
                 <!-- JDBC: optional external plugin -->
                 <template v-if="isJdbcConnection">
-                  <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">{{ t("connection.jdbcUrl") }}</Label>
-                    <Input v-model="form.connection_string" class="col-span-3" :placeholder="t('connection.jdbcUrlPlaceholder')" />
+                  <div v-if="form.driver_profile === 'dremio'" class="grid grid-cols-4 items-center gap-4">
+                    <Label :class="connectionLabelClass">{{ t("connection.mode") }}</Label>
+                    <div class="col-span-3 flex gap-2">
+                      <Button size="sm" :variant="dremioConnectionMode === 'arrow-flight-sql' ? 'default' : 'outline'" @click="applyDremioConnectionMode('arrow-flight-sql')">
+                        {{ t("connection.dremioArrowFlightSqlMode") }}
+                      </Button>
+                      <Button size="sm" :variant="dremioConnectionMode === 'legacy' ? 'default' : 'outline'" @click="applyDremioConnectionMode('legacy')">
+                        {{ t("connection.dremioLegacyJdbcMode") }}
+                      </Button>
+                    </div>
                   </div>
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">{{ t("connection.user") }}</Label>
-                    <Input v-model="form.username" class="col-span-3" placeholder="sa" />
+                    <Label :class="connectionLabelClass">{{ t("connection.jdbcUrl") }}</Label>
+                    <Input v-model="form.connection_string" class="col-span-3" :placeholder="t('connection.jdbcUrlPlaceholder')" @blur="syncDremioConnectionModeFromUrl" />
                   </div>
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">{{ t("connection.password") }}</Label>
+                    <Label :class="connectionLabelClass">{{ t("connection.user") }}</Label>
+                    <Input v-model="form.username" class="col-span-3" :placeholder="jdbcUsernamePlaceholder" />
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label :class="connectionLabelClass">{{ t("connection.password") }}</Label>
                     <PasswordInput v-model="form.password" class="col-span-3" />
                   </div>
                   <div class="grid grid-cols-4 items-start gap-4">
-                    <Label class="text-right mt-2">{{ t("connection.jdbcDriverPaths") }}</Label>
+                    <Label :class="connectionLabelTopClass">{{ t("connection.jdbcDriverPaths") }}</Label>
                     <div class="col-span-3 space-y-2">
                       <Select v-if="jdbcDriverSelectItems.length > 0" :model-value="selectedJdbcDriverPath" @update:model-value="onJdbcDriverSelect">
                         <SelectTrigger>
@@ -2817,7 +3167,7 @@ function openExternalUrl(url: string) {
                     </div>
                   </div>
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">{{ t("connection.jdbcDriverClass") }}</Label>
+                    <Label :class="connectionLabelClass">{{ t("connection.jdbcDriverClass") }}</Label>
                     <Input v-model="form.jdbc_driver_class" class="col-span-3" :placeholder="t('connection.jdbcDriverClassPlaceholder')" />
                   </div>
                   <div class="grid grid-cols-4 items-start gap-4">
@@ -2843,7 +3193,7 @@ function openExternalUrl(url: string) {
                 <!-- Local database files: file path only -->
                 <template v-else-if="usesLocalFilePathInput">
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">{{ t("connection.filePath") }}</Label>
+                    <Label :class="connectionLabelClass">{{ t("connection.filePath") }}</Label>
                     <div class="col-span-3 space-y-1">
                       <div class="flex items-center gap-1">
                         <Input v-model="form.host" class="flex-1" :placeholder="filePathPlaceholder" />
@@ -2878,7 +3228,7 @@ function openExternalUrl(url: string) {
                     </div>
                   </div>
                   <div v-if="form.db_type === 'sqlite'" class="grid grid-cols-4 items-start gap-4">
-                    <Label class="text-right mt-2">{{ t("connection.sqliteExtensions") }}</Label>
+                    <Label :class="connectionLabelTopClass">{{ t("connection.sqliteExtensions") }}</Label>
                     <div class="col-span-3 space-y-1">
                       <div class="flex items-start gap-1">
                         <textarea
@@ -2903,11 +3253,11 @@ function openExternalUrl(url: string) {
                   </div>
                   <template v-if="form.db_type === 'h2' || form.db_type === 'access'">
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right">{{ t("connection.user") }}{{ form.db_type === "access" ? "（可选）" : "" }}</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.user") }}{{ form.db_type === "access" ? "（可选）" : "" }}</Label>
                       <Input v-model="form.username" class="col-span-3" :placeholder="form.db_type === 'access' ? '' : 'sa'" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right">{{ t("connection.password") }}{{ form.db_type === "access" ? "（可选）" : "" }}</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.password") }}{{ form.db_type === "access" ? "（可选）" : "" }}</Label>
                       <PasswordInput v-model="form.password" class="col-span-3" />
                     </div>
                   </template>
@@ -2916,15 +3266,15 @@ function openExternalUrl(url: string) {
                 <!-- Message Queue: admin URL and auth -->
                 <template v-else-if="form.db_type === 'mq'">
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">Admin URL</Label>
+                    <Label :class="connectionLabelClass">Admin URL</Label>
                     <Input v-model="mqAdminUrl" class="col-span-3" placeholder="http://127.0.0.1:8080" />
                   </div>
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">System</Label>
+                    <Label :class="connectionLabelClass">System</Label>
                     <div class="col-span-3 h-9 rounded-md border border-input bg-muted px-3 py-2 text-sm text-muted-foreground">Apache Pulsar</div>
                   </div>
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">Auth</Label>
+                    <Label :class="connectionLabelClass">Auth</Label>
                     <div class="col-span-3 flex flex-wrap gap-2">
                       <Button size="sm" :variant="mqAuthKind === 'none' ? 'default' : 'outline'" @click="mqAuthKind = 'none'">None</Button>
                       <Button size="sm" :variant="mqAuthKind === 'token' ? 'default' : 'outline'" @click="mqAuthKind = 'token'">Token</Button>
@@ -2935,61 +3285,61 @@ function openExternalUrl(url: string) {
                   </div>
                   <template v-if="mqAuthKind === 'token'">
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right">Token</Label>
+                      <Label :class="connectionLabelClass">Token</Label>
                       <Input v-model="mqToken" type="password" class="col-span-3" />
                     </div>
                   </template>
                   <template v-else-if="mqAuthKind === 'basic'">
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right">{{ t("connection.user") }}</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.user") }}</Label>
                       <Input v-model="mqBasicUsername" class="col-span-3" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right">{{ t("connection.password") }}</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.password") }}</Label>
                       <Input v-model="mqBasicPassword" type="password" class="col-span-3" />
                     </div>
                   </template>
                   <template v-else-if="mqAuthKind === 'apiKey'">
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right">Header</Label>
+                      <Label :class="connectionLabelClass">Header</Label>
                       <Input v-model="mqApiKeyHeader" class="col-span-3" placeholder="Authorization" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right">Value</Label>
+                      <Label :class="connectionLabelClass">Value</Label>
                       <Input v-model="mqApiKeyValue" type="password" class="col-span-3" />
                     </div>
                   </template>
                   <template v-else-if="mqAuthKind === 'oauth2'">
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right">Issuer URL</Label>
+                      <Label :class="connectionLabelClass">Issuer URL</Label>
                       <Input v-model="mqOauthIssuerUrl" class="col-span-3" placeholder="https://issuer.example.com/oauth/token" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right">Client ID</Label>
+                      <Label :class="connectionLabelClass">Client ID</Label>
                       <Input v-model="mqOauthClientId" class="col-span-3" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right">Client Secret</Label>
+                      <Label :class="connectionLabelClass">Client Secret</Label>
                       <Input v-model="mqOauthClientSecret" type="password" class="col-span-3" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right">Audience</Label>
+                      <Label :class="connectionLabelClass">Audience</Label>
                       <Input v-model="mqOauthAudience" class="col-span-3" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right">Scope</Label>
+                      <Label :class="connectionLabelClass">Scope</Label>
                       <Input v-model="mqOauthScope" class="col-span-3" />
                     </div>
                   </template>
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right text-xs">TLS</Label>
+                    <Label :class="connectionLabelSmallClass">TLS</Label>
                     <label class="col-span-3 inline-flex items-center gap-2">
                       <input type="checkbox" v-model="mqTlsSkipVerify" class="mr-0" />
                       <span class="text-xs text-muted-foreground">Skip certificate verification</span>
                     </label>
                   </div>
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">Pinned Version</Label>
+                    <Label :class="connectionLabelClass">Pinned Version</Label>
                     <Select v-model="mqPinnedVersion">
                       <SelectTrigger class="col-span-3 h-9">
                         <SelectValue />
@@ -3005,7 +3355,7 @@ function openExternalUrl(url: string) {
                     </Select>
                   </div>
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">Broker Token 签发</Label>
+                    <Label :class="connectionLabelClass">Broker Token 签发</Label>
                     <Select v-model="mqTokenSigningMode">
                       <SelectTrigger class="col-span-3 h-9">
                         <SelectValue />
@@ -3034,7 +3384,7 @@ function openExternalUrl(url: string) {
                 <!-- Nacos: server address, namespace and auth -->
                 <template v-else-if="form.db_type === 'nacos'">
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">{{ t("connection.nacosConsoleUrl") }}</Label>
+                    <Label :class="connectionLabelClass">{{ t("connection.nacosConsoleUrl") }}</Label>
                     <Input v-model="nacosServerAddr" class="col-span-3" placeholder="http://127.0.0.1:8085" />
                   </div>
                   <div class="grid grid-cols-4 items-start gap-4">
@@ -3042,15 +3392,15 @@ function openExternalUrl(url: string) {
                     <p class="col-span-3 m-0 text-xs leading-5 text-muted-foreground">{{ t("connection.nacosConsoleUrlHint") }}</p>
                   </div>
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">{{ t("connection.nacosNamespace") }}</Label>
+                    <Label :class="connectionLabelClass">{{ t("connection.nacosNamespace") }}</Label>
                     <Input v-model="nacosNamespace" class="col-span-3" placeholder="public" />
                   </div>
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">{{ t("connection.nacosContextPath") }}</Label>
+                    <Label :class="connectionLabelClass">{{ t("connection.nacosContextPath") }}</Label>
                     <Input v-model="nacosContextPath" class="col-span-3" :placeholder="t('connection.nacosContextPathPlaceholder')" />
                   </div>
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">{{ t("connection.nacosAuth") }}</Label>
+                    <Label :class="connectionLabelClass">{{ t("connection.nacosAuth") }}</Label>
                     <div class="col-span-3 flex flex-wrap gap-2">
                       <Button size="sm" :variant="nacosAuthKind === 'none' ? 'default' : 'outline'" @click="nacosAuthKind = 'none'">{{ t("connection.nacosAuthNone") }}</Button>
                       <Button size="sm" :variant="nacosAuthKind === 'usernamePassword' ? 'default' : 'outline'" @click="nacosAuthKind = 'usernamePassword'">{{ t("connection.nacosAuthUserPassword") }}</Button>
@@ -3058,23 +3408,23 @@ function openExternalUrl(url: string) {
                   </div>
                   <template v-if="nacosAuthKind === 'usernamePassword'">
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right">{{ t("connection.user") }}</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.user") }}</Label>
                       <Input v-model="nacosUsername" class="col-span-3" placeholder="nacos" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right">{{ t("connection.password") }}</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.password") }}</Label>
                       <PasswordInput v-model="nacosPassword" class="col-span-3" />
                     </div>
                   </template>
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right text-xs">{{ t("connection.nacosTls") }}</Label>
+                    <Label :class="connectionLabelSmallClass">{{ t("connection.nacosTls") }}</Label>
                     <label class="col-span-3 inline-flex items-center gap-2">
                       <input type="checkbox" v-model="nacosTlsSkipVerify" class="mr-0" />
                       <span class="text-xs text-muted-foreground">{{ t("connection.nacosTlsSkipVerify") }}</span>
                     </label>
                   </div>
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">{{ t("connection.nacosPageSize") }}</Label>
+                    <Label :class="connectionLabelClass">{{ t("connection.nacosPageSize") }}</Label>
                     <Input v-model.number="nacosPageSize" type="number" min="1" max="500" class="col-span-3" />
                   </div>
                 </template>
@@ -3082,7 +3432,7 @@ function openExternalUrl(url: string) {
                 <!-- Redis: host, port, user, password, ssl -->
                 <template v-else-if="form.db_type === 'redis'">
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right text-xs">{{ t("connection.mode") }}</Label>
+                    <Label :class="connectionLabelSmallClass">{{ t("connection.mode") }}</Label>
                     <div class="col-span-3 flex gap-2">
                       <Button size="sm" :variant="form.redis_connection_mode === 'standalone' ? 'default' : 'outline'" @click="form.redis_connection_mode = 'standalone'">
                         {{ t("connection.redisStandaloneMode") }}
@@ -3096,13 +3446,13 @@ function openExternalUrl(url: string) {
                     </div>
                   </div>
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">{{ form.redis_connection_mode === "sentinel" ? t("connection.redisFirstSentinel") : form.redis_connection_mode === "cluster" ? t("connection.redisFirstClusterNode") : t("connection.host") }}</Label>
+                    <Label :class="connectionLabelClass">{{ form.redis_connection_mode === "sentinel" ? t("connection.redisFirstSentinel") : form.redis_connection_mode === "cluster" ? t("connection.redisFirstClusterNode") : t("connection.host") }}</Label>
                     <Input v-model="form.host" class="col-span-2" />
                     <Input v-model.number="form.port" type="number" class="col-span-1" />
                   </div>
                   <template v-if="form.redis_connection_mode === 'sentinel'">
                     <div class="grid grid-cols-4 items-start gap-4">
-                      <Label class="text-right mt-2">{{ t("connection.redisSentinelNodes") }}</Label>
+                      <Label :class="connectionLabelTopClass">{{ t("connection.redisSentinelNodes") }}</Label>
                       <textarea
                         v-model="form.redis_sentinel_nodes"
                         class="col-span-3 flex min-h-[76px] w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
@@ -3111,19 +3461,19 @@ function openExternalUrl(url: string) {
                       />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right">{{ t("connection.redisSentinelMaster") }}</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.redisSentinelMaster") }}</Label>
                       <Input v-model="form.redis_sentinel_master" class="col-span-3" placeholder="mymaster" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right">{{ t("connection.redisSentinelUser") }}</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.redisSentinelUser") }}</Label>
                       <Input v-model="form.redis_sentinel_username" class="col-span-3" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right">{{ t("connection.redisSentinelPassword") }}</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.redisSentinelPassword") }}</Label>
                       <PasswordInput v-model="form.redis_sentinel_password" class="col-span-3" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right text-xs">{{ t("connection.redisSentinelTls") }}</Label>
+                      <Label :class="connectionLabelSmallClass">{{ t("connection.redisSentinelTls") }}</Label>
                       <label class="col-span-3 inline-flex items-center gap-2">
                         <input type="checkbox" v-model="form.redis_sentinel_tls" class="mr-0" />
                         <span class="text-xs text-muted-foreground">{{ t("connection.redisSentinelTlsHint") }}</span>
@@ -3132,7 +3482,7 @@ function openExternalUrl(url: string) {
                   </template>
                   <template v-else-if="form.redis_connection_mode === 'cluster'">
                     <div class="grid grid-cols-4 items-start gap-4">
-                      <Label class="text-right mt-2">{{ t("connection.redisClusterNodes") }}</Label>
+                      <Label :class="connectionLabelTopClass">{{ t("connection.redisClusterNodes") }}</Label>
                       <textarea
                         v-model="form.redis_cluster_nodes"
                         class="col-span-3 flex min-h-[76px] w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
@@ -3142,15 +3492,15 @@ function openExternalUrl(url: string) {
                     </div>
                   </template>
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">{{ t("connection.user") }}</Label>
+                    <Label :class="connectionLabelClass">{{ t("connection.user") }}</Label>
                     <Input v-model="form.username" class="col-span-3" placeholder="default" />
                   </div>
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">{{ t("connection.password") }}</Label>
+                    <Label :class="connectionLabelClass">{{ t("connection.password") }}</Label>
                     <PasswordInput v-model="form.password" class="col-span-3" :placeholder="t('connection.databasePlaceholder')" />
                   </div>
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right text-xs">{{ t("connection.redisKeySeparator") }}</Label>
+                    <Label :class="connectionLabelSmallClass">{{ t("connection.redisKeySeparator") }}</Label>
                     <Input v-model="form.redis_key_separator" class="col-span-3 h-8 text-xs" placeholder=":" />
                   </div>
                 </template>
@@ -3158,12 +3508,12 @@ function openExternalUrl(url: string) {
                 <!-- etcd: endpoints, user, password, TLS -->
                 <template v-else-if="form.db_type === 'etcd'">
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">{{ t("connection.host") }}</Label>
+                    <Label :class="connectionLabelClass">{{ t("connection.host") }}</Label>
                     <Input v-model="form.host" class="col-span-2" />
                     <Input v-model.number="form.port" type="number" class="col-span-1" />
                   </div>
                   <div class="grid grid-cols-4 items-start gap-4">
-                    <Label class="text-right mt-2">{{ t("connection.etcdEndpoints") }}</Label>
+                    <Label :class="connectionLabelTopClass">{{ t("connection.etcdEndpoints") }}</Label>
                     <div class="col-span-3 space-y-1">
                       <textarea
                         v-model="etcdEndpointsLines"
@@ -3177,11 +3527,11 @@ function openExternalUrl(url: string) {
                     </div>
                   </div>
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">{{ t("connection.user") }}</Label>
+                    <Label :class="connectionLabelClass">{{ t("connection.user") }}</Label>
                     <Input v-model="form.username" class="col-span-3" />
                   </div>
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">{{ t("connection.password") }}</Label>
+                    <Label :class="connectionLabelClass">{{ t("connection.password") }}</Label>
                     <PasswordInput v-model="form.password" class="col-span-3" />
                   </div>
                 </template>
@@ -3189,12 +3539,12 @@ function openExternalUrl(url: string) {
                 <!-- ZooKeeper: host, connect string, user, password -->
                 <template v-else-if="form.db_type === 'zookeeper'">
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">{{ t("connection.host") }}</Label>
+                    <Label :class="connectionLabelClass">{{ t("connection.host") }}</Label>
                     <Input v-model="form.host" class="col-span-2" placeholder="127.0.0.1" />
                     <Input v-model.number="form.port" type="number" class="col-span-1" />
                   </div>
                   <div class="grid grid-cols-4 items-start gap-4">
-                    <Label class="text-right mt-2">{{ t("connection.zookeeperConnectString") }}</Label>
+                    <Label :class="connectionLabelTopClass">{{ t("connection.zookeeperConnectString") }}</Label>
                     <div class="col-span-3 space-y-1">
                       <textarea
                         v-model="zookeeperConnectString"
@@ -3208,11 +3558,11 @@ function openExternalUrl(url: string) {
                     </div>
                   </div>
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">{{ t("connection.user") }}</Label>
+                    <Label :class="connectionLabelClass">{{ t("connection.user") }}</Label>
                     <Input v-model="form.username" class="col-span-3" />
                   </div>
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">{{ t("connection.password") }}</Label>
+                    <Label :class="connectionLabelClass">{{ t("connection.password") }}</Label>
                     <PasswordInput v-model="form.password" class="col-span-3" />
                   </div>
                 </template>
@@ -3220,7 +3570,7 @@ function openExternalUrl(url: string) {
                 <!-- MongoDB: URL or form -->
                 <template v-else-if="form.db_type === 'mongodb'">
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right text-xs">{{ t("connection.driverMode") }}</Label>
+                    <Label :class="connectionLabelSmallClass">{{ t("connection.driverMode") }}</Label>
                     <div class="col-span-3 flex items-center gap-2">
                       <Button size="sm" :variant="mongoDriverMode === 'legacy' ? 'outline' : 'default'" @click="mongoDriverMode = 'auto'">{{ t("connection.mongoDriverAuto") }}</Button>
                       <Button size="sm" :variant="mongoDriverMode === 'legacy' ? 'default' : 'outline'" @click="mongoDriverMode = 'legacy'">{{ t("connection.mongoDriverLegacy") }}</Button>
@@ -3235,7 +3585,7 @@ function openExternalUrl(url: string) {
                     </div>
                   </div>
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right text-xs">{{ t("connection.mode") }}</Label>
+                    <Label :class="connectionLabelSmallClass">{{ t("connection.mode") }}</Label>
                     <div class="col-span-3 flex gap-2">
                       <Button size="sm" :variant="mongoUseUrl ? 'outline' : 'default'" @click="mongoUseUrl = false">{{ t("connection.modeForm") }}</Button>
                       <Button size="sm" :variant="mongoUseUrl ? 'default' : 'outline'" @click="mongoUseUrl = true">URL</Button>
@@ -3243,7 +3593,7 @@ function openExternalUrl(url: string) {
                   </div>
                   <template v-if="mongoUseUrl">
                     <div class="grid grid-cols-4 items-start gap-4">
-                      <Label class="text-right mt-2">URL</Label>
+                      <Label :class="connectionLabelTopClass">URL</Label>
                       <textarea
                         v-model="form.connection_string"
                         class="col-span-3 flex min-h-[80px] w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
@@ -3253,7 +3603,7 @@ function openExternalUrl(url: string) {
                   </template>
                   <template v-else>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right">{{ t("connection.host") }}</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.host") }}</Label>
                       <Input v-model="form.host" class="col-span-2" />
                       <Input v-model.number="form.port" type="number" class="col-span-1" />
                     </div>
@@ -3265,23 +3615,23 @@ function openExternalUrl(url: string) {
                       </label>
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right">{{ t("connection.user") }}</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.user") }}</Label>
                       <Input v-model="form.username" class="col-span-3" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right">{{ t("connection.password") }}</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.password") }}</Label>
                       <PasswordInput v-model="form.password" class="col-span-3" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right">{{ t("connection.defaultDatabase") }}</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.defaultDatabase") }}</Label>
                       <Input v-model="form.database" class="col-span-3" :placeholder="t('connection.databasePlaceholder')" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right">{{ t("connection.authDatabase") }}</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.authDatabase") }}</Label>
                       <Input v-model="mongoAuthDatabase" class="col-span-3" :placeholder="t('connection.authDatabasePlaceholder')" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right">{{ t("connection.authMechanism") }}</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.authMechanism") }}</Label>
                       <Select v-model="mongoAuthMechanism">
                         <SelectTrigger class="col-span-3">
                           <SelectValue />
@@ -3294,7 +3644,7 @@ function openExternalUrl(url: string) {
                       </Select>
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right">{{ t("connection.urlParams") }}</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.urlParams") }}</Label>
                       <Input v-model="form.url_params" class="col-span-3" placeholder="authSource=admin&authMechanism=SCRAM-SHA-1" />
                     </div>
                   </template>
@@ -3303,7 +3653,7 @@ function openExternalUrl(url: string) {
                 <!-- Turso: simplified form (URL + Token) -->
                 <template v-else-if="form.db_type === 'turso'">
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">{{ t("connection.host") }}</Label>
+                    <Label :class="connectionLabelClass">{{ t("connection.host") }}</Label>
                     <Input v-model="form.host" class="col-span-3" placeholder="your-database.turso.io 或 libsql://your-database.turso.io" />
                   </div>
 
@@ -3313,7 +3663,7 @@ function openExternalUrl(url: string) {
                   </div>
 
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">Auth Token</Label>
+                    <Label :class="connectionLabelClass">Auth Token</Label>
                     <PasswordInput v-model="form.password" class="col-span-3" placeholder="eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9..." />
                   </div>
 
@@ -3323,7 +3673,7 @@ function openExternalUrl(url: string) {
                   </div>
 
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">{{ t("connection.urlParams") }}</Label>
+                    <Label :class="connectionLabelClass">{{ t("connection.urlParams") }}</Label>
                     <Input v-model="form.url_params" class="col-span-3" placeholder="authToken=xxx（可选，优先使用上面的 Token 字段）" />
                   </div>
                 </template>
@@ -3331,38 +3681,38 @@ function openExternalUrl(url: string) {
                 <!-- MySQL / PostgreSQL: host, port, user, password, database -->
                 <template v-else>
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">{{ t("connection.host") }}</Label>
+                    <Label :class="connectionLabelClass">{{ t("connection.host") }}</Label>
                     <Input v-model="form.host" class="col-span-2" />
                     <Input v-model.number="form.port" type="number" class="col-span-1" />
                   </div>
 
                   <div v-if="form.driver_profile === 'gbase8s'" class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right text-xs">{{ t("connection.gbaseServer") }}</Label>
+                    <Label :class="connectionLabelSmallClass">{{ t("connection.gbaseServer") }}</Label>
                     <Input v-model="form.gbase_server" class="col-span-3" placeholder="gbase01" />
                   </div>
 
                   <div v-if="form.db_type === 'informix'" class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right text-xs">{{ t("connection.informixServer") }}</Label>
+                    <Label :class="connectionLabelSmallClass">{{ t("connection.informixServer") }}</Label>
                     <Input v-model="form.informix_server" class="col-span-3" placeholder="ol_informix1170" />
                   </div>
 
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">{{ t("connection.user") }}</Label>
+                    <Label :class="connectionLabelClass">{{ t("connection.user") }}</Label>
                     <Input v-model="form.username" class="col-span-3" />
                   </div>
 
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">{{ t("connection.password") }}</Label>
+                    <Label :class="connectionLabelClass">{{ t("connection.password") }}</Label>
                     <PasswordInput v-model="form.password" class="col-span-3" />
                   </div>
 
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">{{ databaseLabel }}</Label>
+                    <Label :class="connectionLabelClass">{{ databaseLabel }}</Label>
                     <Input v-model="form.database" class="col-span-3" :placeholder="databasePlaceholder" />
                   </div>
 
                   <div v-if="form.db_type === 'oracle'" class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right text-xs">{{ t("connection.mode") }}</Label>
+                    <Label :class="connectionLabelSmallClass">{{ t("connection.mode") }}</Label>
                     <div class="col-span-3 grid h-8 grid-cols-2 overflow-hidden rounded-md border border-input bg-muted/30 p-0.5">
                       <button
                         type="button"
@@ -3394,7 +3744,7 @@ function openExternalUrl(url: string) {
                   </div>
 
                   <div v-if="form.db_type === 'oracle'" class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right text-xs">SYSDBA</Label>
+                    <Label :class="connectionLabelSmallClass">SYSDBA</Label>
                     <label class="col-span-3 flex items-center gap-2 cursor-pointer">
                       <input type="checkbox" v-model="form.sysdba" class="mr-0" :disabled="isOracleSysUser(form)" />
                       <span class="text-xs text-muted-foreground">as SYSDBA</span>
@@ -3402,7 +3752,7 @@ function openExternalUrl(url: string) {
                   </div>
 
                   <div v-if="supportsGenericUrlParams" class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">{{ t("connection.urlParams") }}</Label>
+                    <Label :class="connectionLabelClass">{{ t("connection.urlParams") }}</Label>
                     <Input
                       v-model="form.url_params"
                       class="col-span-3"
@@ -3417,14 +3767,16 @@ function openExternalUrl(url: string) {
                                 ? 'OAuthType=0;OAuthServiceAcctEmail=svc@project.iam.gserviceaccount.com;OAuthPvtKeyPath=/path/key.json'
                                 : form.db_type === 'informix'
                                   ? 'CLIENT_LOCALE=en_US.utf8;DB_LOCALE=en_US.utf8'
-                                  : 'sslmode=disable'
+                                  : form.db_type === 'influxdb'
+                                    ? 'epoch=ms'
+                                    : 'sslmode=disable'
                       "
                     />
                   </div>
 
                   <template v-if="isPrestoSqlConnection">
                     <div class="grid grid-cols-4 items-start gap-4">
-                      <Label class="text-right mt-2">{{ t("connection.jdbcDriverPaths") }}</Label>
+                      <Label :class="connectionLabelTopClass">{{ t("connection.jdbcDriverPaths") }}</Label>
                       <div class="col-span-3 space-y-2">
                         <Select v-if="jdbcDriverSelectItems.length > 0" :model-value="selectedJdbcDriverPath" @update:model-value="onJdbcDriverSelect">
                           <SelectTrigger>
@@ -3463,7 +3815,7 @@ function openExternalUrl(url: string) {
                       </div>
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right">{{ t("connection.jdbcDriverClass") }}</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.jdbcDriverClass") }}</Label>
                       <Input v-model="form.jdbc_driver_class" class="col-span-3" :placeholder="t('connection.jdbcDriverClassPlaceholder')" />
                     </div>
                     <div class="grid grid-cols-4 items-start gap-4">
@@ -3490,9 +3842,9 @@ function openExternalUrl(url: string) {
             </TabsContent>
 
             <TabsContent v-if="supportsTlsToggle" value="tls" class="m-0">
-              <div class="grid gap-4 py-4 pr-2 max-h-[65vh] overflow-y-auto">
+              <div class="connection-form-body grid gap-4 py-4 pr-2 max-h-[65vh] overflow-y-auto">
                 <div v-if="!supportsPostgresTlsOptions && !supportsMysqlTlsOptions" class="grid grid-cols-4 items-center gap-4">
-                  <Label class="text-right text-xs">SSL/TLS</Label>
+                  <Label :class="connectionLabelSmallClass">SSL/TLS</Label>
                   <label class="col-span-3 flex items-center gap-2 cursor-pointer">
                     <input type="checkbox" v-model="form.ssl" class="mr-0" />
                     <span class="text-xs text-muted-foreground">{{ t("connection.sslEnable") }}</span>
@@ -3500,7 +3852,7 @@ function openExternalUrl(url: string) {
                 </div>
 
                 <div v-if="form.db_type === 'redis'" class="grid grid-cols-4 items-start gap-4">
-                  <Label class="text-right text-xs">{{ t("connection.redisTlsInsecure") }}</Label>
+                  <Label :class="connectionLabelSmallClass">{{ t("connection.redisTlsInsecure") }}</Label>
                   <label class="col-span-3 flex items-start gap-2 cursor-pointer">
                     <input type="checkbox" v-model="redisTlsInsecure" class="mr-0 mt-0.5" :disabled="!form.ssl" />
                     <span class="text-xs leading-5 text-muted-foreground">
@@ -3511,7 +3863,7 @@ function openExternalUrl(url: string) {
 
                 <template v-if="form.db_type === 'etcd'">
                   <div class="grid grid-cols-4 items-start gap-4">
-                    <Label class="pt-2 text-right text-xs">
+                    <Label :class="connectionLabelSmallPaddedClass">
                       <span class="inline-flex items-center justify-end gap-1">
                         <ShieldCheck class="h-3.5 w-3.5" />
                         {{ t("connection.caCertPath") }}
@@ -3533,7 +3885,7 @@ function openExternalUrl(url: string) {
                   </div>
 
                   <div class="grid grid-cols-4 items-start gap-4">
-                    <Label class="pt-2 text-right text-xs">
+                    <Label :class="connectionLabelSmallPaddedClass">
                       <span class="inline-flex items-center justify-end gap-1">
                         <KeyRound class="h-3.5 w-3.5" />
                         {{ t("connection.etcdClientAuth") }}
@@ -3571,7 +3923,7 @@ function openExternalUrl(url: string) {
 
                 <template v-if="supportsMysqlTlsOptions">
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right text-xs">{{ t("connection.mysqlTlsMode") }}</Label>
+                    <Label :class="connectionLabelSmallClass">{{ t("connection.mysqlTlsMode") }}</Label>
                     <Select v-model="mysqlTlsMode">
                       <SelectTrigger class="col-span-3 h-9">
                         <SelectValue />
@@ -3587,7 +3939,7 @@ function openExternalUrl(url: string) {
                   </div>
 
                   <div class="grid grid-cols-4 items-start gap-4">
-                    <Label class="pt-2 text-right text-xs">
+                    <Label :class="connectionLabelSmallPaddedClass">
                       <span class="inline-flex items-center justify-end gap-1">
                         <ShieldCheck class="h-3.5 w-3.5" />
                         {{ t("connection.caCertPath") }}
@@ -3612,7 +3964,7 @@ function openExternalUrl(url: string) {
                   </div>
 
                   <div class="grid grid-cols-4 items-start gap-4">
-                    <Label class="pt-2 text-right text-xs">
+                    <Label :class="connectionLabelSmallPaddedClass">
                       <span class="inline-flex items-center justify-end gap-1">
                         <KeyRound class="h-3.5 w-3.5" />
                         {{ t("connection.mysqlClientCert") }}
@@ -3650,7 +4002,7 @@ function openExternalUrl(url: string) {
 
                 <template v-if="supportsPostgresTlsOptions">
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right text-xs">{{ t("connection.postgresSslMode") }}</Label>
+                    <Label :class="connectionLabelSmallClass">{{ t("connection.postgresSslMode") }}</Label>
                     <Select v-model="postgresTlsMode">
                       <SelectTrigger class="col-span-3 h-9">
                         <SelectValue />
@@ -3666,7 +4018,7 @@ function openExternalUrl(url: string) {
                   </div>
 
                   <div class="grid grid-cols-4 items-start gap-4">
-                    <Label class="pt-2 text-right text-xs">
+                    <Label :class="connectionLabelSmallPaddedClass">
                       <span class="inline-flex items-center justify-end gap-1">
                         <ShieldCheck class="h-3.5 w-3.5" />
                         {{ t("connection.postgresServerCert") }}
@@ -3691,7 +4043,7 @@ function openExternalUrl(url: string) {
                   </div>
 
                   <div class="grid grid-cols-4 items-start gap-4">
-                    <Label class="pt-2 text-right text-xs">
+                    <Label :class="connectionLabelSmallPaddedClass">
                       <span class="inline-flex items-center justify-end gap-1">
                         <KeyRound class="h-3.5 w-3.5" />
                         {{ t("connection.postgresClientCert") }}
@@ -3728,7 +4080,7 @@ function openExternalUrl(url: string) {
                 </template>
 
                 <div v-if="supportsCaCertificatePath" class="grid grid-cols-4 items-center gap-4">
-                  <Label class="text-right text-xs">{{ t("connection.caCertPath") }}</Label>
+                  <Label :class="connectionLabelSmallClass">{{ t("connection.caCertPath") }}</Label>
                   <div class="col-span-3 flex items-center gap-1">
                     <Input v-model="form.ca_cert_path" class="flex-1" :placeholder="t('connection.caCertPathPlaceholder')" :disabled="!form.ssl" />
                     <Tooltip v-if="isDesktop">
@@ -3745,40 +4097,56 @@ function openExternalUrl(url: string) {
             </TabsContent>
 
             <TabsContent value="advanced" class="m-0">
-              <div class="grid gap-4 py-4 pr-2 max-h-[65vh] overflow-y-auto">
+              <div class="connection-form-body grid gap-4 py-4 pr-2 max-h-[65vh] overflow-y-auto">
                 <div class="grid grid-cols-4 items-center gap-4">
-                  <Label class="text-right text-xs">{{ t("connection.connectTimeout") }}</Label>
+                  <Label :class="connectionLabelSmallClass">{{ t("connection.connectTimeout") }}</Label>
                   <Input v-model.number="form.connect_timeout_secs" type="number" min="1" max="300" step="1" class="col-span-3" />
                 </div>
                 <div class="grid grid-cols-4 items-center gap-4">
-                  <Label class="text-right text-xs">{{ t("connection.queryTimeout") }}</Label>
+                  <Label :class="connectionLabelSmallClass">{{ t("connection.queryTimeout") }}</Label>
                   <Input v-model.number="form.query_timeout_secs" type="number" min="0" max="300" step="1" class="col-span-3" />
                 </div>
                 <div v-show="form.db_type === 'mongodb'" class="grid grid-cols-4 items-center gap-4">
-                  <Label class="text-right text-xs">{{ t("connection.idleTimeout") }}</Label>
+                  <Label :class="connectionLabelSmallClass">{{ t("connection.idleTimeout") }}</Label>
                   <Input v-model.number="form.idle_timeout_secs" type="number" min="0" max="600" step="1" class="col-span-3" />
                 </div>
                 <div class="grid grid-cols-4 items-center gap-4">
-                  <Label class="text-right text-xs">{{ t("connection.keepaliveInterval") }}</Label>
+                  <Label :class="connectionLabelSmallClass">{{ t("connection.keepaliveInterval") }}</Label>
                   <div class="col-span-3 flex items-center gap-2">
                     <Switch v-model="keepaliveEnabled" />
                     <Input v-model.number="form.keepalive_interval_secs" type="number" min="1" max="3600" step="1" class="flex-1" :disabled="!keepaliveEnabled" />
                   </div>
                 </div>
                 <div class="grid grid-cols-4 items-center gap-4">
-                  <Label class="text-right text-xs">{{ t("connection.readOnly") }}</Label>
+                  <Label :class="connectionLabelSmallClass">{{ t("connection.readOnly") }}</Label>
                   <label class="col-span-3 flex items-center gap-2 cursor-pointer">
                     <input type="checkbox" v-model="form.read_only" class="mr-0" />
                     <span class="text-xs text-muted-foreground">{{ t("connection.readOnlyHint") }}</span>
                   </label>
                 </div>
+                <div v-show="form.db_type === 'redis'" class="grid grid-cols-4 items-center gap-4">
+                  <Label :class="connectionLabelSmallClass">{{ t("settings.redisScanPageSize") }}</Label>
+                  <div class="col-span-3 flex flex-col gap-1">
+                    <Select :model-value="String(form.redis_scan_page_size ?? REDIS_SCAN_PAGE_SIZE_DEFAULT)" @update:model-value="form.redis_scan_page_size = Number($event)">
+                      <SelectTrigger>
+                        <SelectValue :placeholder="t('settings.redisScanPageSize')" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem v-for="size in REDIS_SCAN_PAGE_SIZE_OPTIONS" :key="size" :value="String(size)">
+                          {{ t("settings.redisScanPageSizeOption", { count: size }) }}
+                        </SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <p class="text-xs text-muted-foreground">{{ t("settings.redisScanPageSizeDescription") }}</p>
+                  </div>
+                </div>
               </div>
             </TabsContent>
 
             <TabsContent v-if="canUseTransportLayers" value="transport" class="m-0">
-              <div class="grid gap-4 py-4 pr-2 max-h-[65vh] overflow-y-auto">
+              <div class="connection-form-body grid gap-4 py-4 pr-2 max-h-[65vh] overflow-y-auto">
                 <div class="grid grid-cols-4 items-start gap-4">
-                  <Label class="pt-2 text-right text-xs">{{ t("connection.sshHops") }}</Label>
+                  <Label :class="connectionLabelSmallPaddedClass">{{ t("connection.sshHops") }}</Label>
                   <div class="col-span-3 grid gap-3">
                     <div class="flex flex-wrap items-center gap-1 text-[11px] text-muted-foreground">
                       <template v-for="(segment, index) in transportPathSegments" :key="`${segment}-${index}`">
@@ -3846,11 +4214,11 @@ function openExternalUrl(url: string) {
 
                 <template v-if="selectedTransportLayer">
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right text-xs">{{ t("connection.sshHopName") }}</Label>
+                    <Label :class="connectionLabelSmallClass">{{ t("connection.sshHopName") }}</Label>
                     <Input v-model="selectedTransportLayer.name" class="col-span-3" :placeholder="t('connection.sshHopNamePlaceholder')" />
                   </div>
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right text-xs">Type</Label>
+                    <Label :class="connectionLabelSmallClass">Type</Label>
                     <Select :model-value="selectedTransportLayer.type" @update:model-value="(value: any) => changeSelectedTransportLayerType(value)">
                       <SelectTrigger class="col-span-3 h-9">
                         <SelectValue />
@@ -3863,20 +4231,20 @@ function openExternalUrl(url: string) {
                   </div>
                   <template v-if="selectedSshLayer">
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right text-xs">{{ t("connection.sshHost") }}</Label>
+                      <Label :class="connectionLabelSmallClass">{{ t("connection.sshHost") }}</Label>
                       <Input v-model="selectedSshLayer.host" class="col-span-2" placeholder="ssh.example.com" :disabled="selectedSshLayer.enabled === false" />
                       <Input v-model.number="selectedSshLayer.port" type="number" min="1" max="65535" class="col-span-1" :disabled="selectedSshLayer.enabled === false" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right text-xs">{{ t("connection.sshUser") }}</Label>
+                      <Label :class="connectionLabelSmallClass">{{ t("connection.sshUser") }}</Label>
                       <Input v-model="selectedSshLayer.user" class="col-span-3" placeholder="root" :disabled="selectedSshLayer.enabled === false" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right text-xs">{{ t("connection.sshPassword") }}</Label>
+                      <Label :class="connectionLabelSmallClass">{{ t("connection.sshPassword") }}</Label>
                       <PasswordInput v-model="selectedSshLayer.password" class="col-span-3" :placeholder="t('connection.sshPasswordPlaceholder')" :disabled="selectedSshLayer.enabled === false" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right text-xs">{{ t("connection.sshKeyPath") }}</Label>
+                      <Label :class="connectionLabelSmallClass">{{ t("connection.sshKeyPath") }}</Label>
                       <div class="col-span-3 flex items-center gap-1">
                         <Input v-model="selectedSshLayer.key_path" class="flex-1" placeholder="~/.ssh/id_rsa" :disabled="selectedSshLayer.enabled === false" />
                         <Tooltip v-if="isDesktop">
@@ -3890,7 +4258,7 @@ function openExternalUrl(url: string) {
                       </div>
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right text-xs">{{ t("connection.sshKeyPassphrase") }}</Label>
+                      <Label :class="connectionLabelSmallClass">{{ t("connection.sshKeyPassphrase") }}</Label>
                       <PasswordInput v-model="selectedSshLayer.key_passphrase" class="col-span-3" :placeholder="t('connection.sshKeyPassphrasePlaceholder')" :disabled="selectedSshLayer.enabled === false" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
@@ -3901,7 +4269,7 @@ function openExternalUrl(url: string) {
                       </label>
                     </div>
                     <div v-if="selectedSshLayer.use_ssh_agent" class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right text-xs">{{ t("connection.sshAgentSockPath") }}</Label>
+                      <Label :class="connectionLabelSmallClass">{{ t("connection.sshAgentSockPath") }}</Label>
                       <Input v-model="selectedSshLayer.ssh_agent_sock_path" class="col-span-3" :placeholder="t('connection.sshAgentSockPathPlaceholder')" :disabled="selectedSshLayer.enabled === false" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
@@ -3912,13 +4280,13 @@ function openExternalUrl(url: string) {
                       </label>
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right text-xs">{{ t("connection.sshConnectTimeout") }}</Label>
+                      <Label :class="connectionLabelSmallClass">{{ t("connection.sshConnectTimeout") }}</Label>
                       <Input v-model.number="selectedSshLayer.connect_timeout_secs" type="number" min="1" max="300" step="1" class="col-span-3" :disabled="selectedSshLayer.enabled === false" />
                     </div>
                   </template>
                   <template v-else-if="selectedProxyLayer">
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right text-xs">{{ t("connection.proxyType") }}</Label>
+                      <Label :class="connectionLabelSmallClass">{{ t("connection.proxyType") }}</Label>
                       <Select :model-value="selectedProxyLayer.proxy_type || 'socks5'" :disabled="selectedProxyLayer.enabled === false" @update:model-value="updateSelectedProxyType">
                         <SelectTrigger class="col-span-3 h-9">
                           <SelectValue />
@@ -3930,16 +4298,16 @@ function openExternalUrl(url: string) {
                       </Select>
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right text-xs">{{ t("connection.proxyHost") }}</Label>
+                      <Label :class="connectionLabelSmallClass">{{ t("connection.proxyHost") }}</Label>
                       <Input v-model="selectedProxyLayer.host" class="col-span-2" placeholder="127.0.0.1" :disabled="selectedProxyLayer.enabled === false" />
                       <Input v-model.number="selectedProxyLayer.port" type="number" class="col-span-1" :disabled="selectedProxyLayer.enabled === false" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right text-xs">{{ t("connection.proxyUsername") }}</Label>
+                      <Label :class="connectionLabelSmallClass">{{ t("connection.proxyUsername") }}</Label>
                       <Input v-model="selectedProxyLayer.username" class="col-span-3" :placeholder="t('connection.proxyUsernamePlaceholder')" :disabled="selectedProxyLayer.enabled === false" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label class="text-right text-xs">{{ t("connection.proxyPassword") }}</Label>
+                      <Label :class="connectionLabelSmallClass">{{ t("connection.proxyPassword") }}</Label>
                       <PasswordInput v-model="selectedProxyLayer.password" class="col-span-3" :placeholder="t('connection.proxyPasswordPlaceholder')" :disabled="selectedProxyLayer.enabled === false" />
                     </div>
                   </template>
@@ -3967,12 +4335,12 @@ function openExternalUrl(url: string) {
           <Button v-if="canChooseVisibleDatabases" variant="outline" class="shrink-0" :disabled="isTesting || isSaving || isLoadingVisibleDatabases || !hasRequiredConnectionTarget" @click="openVisibleDatabasesPicker">
             <Loader2 v-if="isLoadingVisibleDatabases" class="mr-1.5 h-4 w-4 animate-spin" />
             <ListFilter v-else class="mr-1.5 h-4 w-4" />
-            {{ hasVisibleDatabaseFilter ? visibleDatabaseSummary : t("contextMenu.selectVisibleDatabases") }}
+            {{ hasVisibleObjectFilter ? visibleObjectSummary : visibleFilterUsesSchemas ? t("contextMenu.configureVisibleObjects") : t("contextMenu.selectVisibleDatabases") }}
           </Button>
-          <Button v-if="canChooseVisibleSchemas" variant="outline" class="shrink-0" :disabled="isTesting || isSaving || isLoadingVisibleSchemas || !hasRequiredConnectionTarget" @click="openVisibleSchemasPicker">
+          <Button v-if="canChooseVisibleSchemas && !visibleFilterUsesSchemas && hasVisibleSchemaFilter" variant="outline" class="shrink-0" :disabled="isTesting || isSaving || isLoadingVisibleSchemas || !hasRequiredConnectionTarget" @click="openVisibleSchemasPicker">
             <Loader2 v-if="isLoadingVisibleSchemas" class="mr-1.5 h-4 w-4 animate-spin" />
             <ListFilter v-else class="mr-1.5 h-4 w-4" />
-            {{ hasVisibleSchemaFilter ? visibleSchemaSummary : t("visibleSchemas.showAll") }}
+            {{ visibleSchemaSummary }}
           </Button>
           <Button variant="outline" class="shrink-0" :disabled="isTesting || isSaving" @click="testConnection">
             {{ isTesting ? t("connection.testing") : t("connection.test") }}
@@ -3988,21 +4356,21 @@ function openExternalUrl(url: string) {
   <Dialog v-model:open="showVisibleDatabasesDialog">
     <DialogContent class="sm:max-w-[460px]">
       <DialogHeader>
-        <DialogTitle>{{ t("visibleDatabases.title") }}</DialogTitle>
+        <DialogTitle>{{ t(visibleObjectTitleKey) }}</DialogTitle>
         <p class="text-sm text-muted-foreground">
-          {{ t("visibleDatabases.description", { connection: form.name || selectedProfile().label }) }}
+          {{ t(visibleObjectDescriptionKey, { connection: form.name || selectedProfile().label }) }}
         </p>
       </DialogHeader>
 
       <div class="flex items-center gap-2 rounded-md border bg-background px-2">
         <Search class="h-4 w-4 shrink-0 text-muted-foreground" />
-        <Input v-model="visibleDatabaseSearchText" :placeholder="t('visibleDatabases.searchPlaceholder')" class="h-8 border-0 px-0 shadow-none focus-visible:ring-0" :disabled="isLoadingVisibleDatabases || !!visibleDatabaseError" />
+        <Input v-model="visibleDatabaseSearchText" :placeholder="t(visibleObjectSearchPlaceholderKey)" class="h-8 border-0 px-0 shadow-none focus-visible:ring-0" :disabled="isLoadingVisibleDatabases || !!visibleDatabaseError" />
       </div>
 
       <div class="flex items-center justify-between text-xs text-muted-foreground">
         <span>
           {{
-            t("visibleDatabases.selectedCount", {
+            t(visibleObjectSelectedCountKey, {
               selected: visibleDatabaseSelectedCount,
               total: visibleDatabaseTotalCount,
             })
@@ -4021,7 +4389,7 @@ function openExternalUrl(url: string) {
         </div>
       </div>
       <p v-if="!isLoadingVisibleDatabases && !visibleDatabaseError && !visibleDatabaseCanSave" class="text-xs text-destructive">
-        {{ t("visibleDatabases.emptySelection") }}
+        {{ t(visibleObjectEmptySelectionKey) }}
       </p>
 
       <label v-if="visibleDatabaseHasSystemDatabases" class="flex h-8 items-center gap-2 rounded-md px-1 text-xs text-muted-foreground">
@@ -4035,7 +4403,7 @@ function openExternalUrl(url: string) {
           {{ t("common.loading") }}
         </div>
         <div v-else-if="visibleDatabaseError" class="p-3 text-sm text-destructive">
-          {{ t("visibleDatabases.loadFailed", { message: visibleDatabaseError }) }}
+          {{ t(visibleObjectLoadFailedKey, { message: visibleDatabaseError }) }}
         </div>
         <div v-else-if="!filteredVisibleDatabaseNames.length" class="p-3 text-sm text-muted-foreground">
           {{ t("grid.noSearchResults") }}
@@ -4058,7 +4426,7 @@ function openExternalUrl(url: string) {
       <DialogFooter>
         <Button variant="outline" @click="showVisibleDatabasesDialog = false">{{ t("dangerDialog.cancel") }}</Button>
         <Button :disabled="isLoadingVisibleDatabases || !!visibleDatabaseError || !visibleDatabaseCanSave" @click="saveVisibleDatabaseSelection">
-          {{ t("visibleDatabases.save") }}
+          {{ t(visibleObjectSaveKey) }}
         </Button>
       </DialogFooter>
     </DialogContent>
@@ -4078,3 +4446,14 @@ function openExternalUrl(url: string) {
     @draft:show-all="handleDraftSchemasShowAll"
   />
 </template>
+
+<style>
+.connection-dialog-content[data-wide="true"] .grid.grid-cols-4 {
+  grid-template-columns: minmax(5.5rem, 0.7fr) repeat(3, minmax(0, 1fr));
+}
+
+.connection-dialog-content[data-wide="true"] .connection-form-body {
+  width: min(100%, 36rem);
+  margin-inline: auto;
+}
+</style>

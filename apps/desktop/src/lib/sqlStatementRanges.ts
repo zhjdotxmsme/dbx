@@ -11,7 +11,7 @@ export interface SqlTextRange {
   sql: string;
 }
 
-const NON_SQL_EXECUTION_TARGET_TYPES: ReadonlySet<DatabaseType> = new Set(["mongodb", "elasticsearch", "qdrant", "milvus", "weaviate", "etcd", "zookeeper", "mq", "neo4j"]);
+const NON_SQL_EXECUTION_TARGET_TYPES: ReadonlySet<DatabaseType> = new Set(["mongodb", "elasticsearch", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper", "mq", "neo4j"]);
 
 export function supportsExecutionTargetPicker(databaseType?: DatabaseType): boolean {
   return !!databaseType && (databaseType === "redis" || !NON_SQL_EXECUTION_TARGET_TYPES.has(databaseType));
@@ -21,7 +21,7 @@ export function hasMultipleExecutionTargets(sql: string, databaseType?: Database
   if (databaseType === "redis") {
     return redisExecutableCommandCount(sql) > 1;
   }
-  return splitSqlStatementRanges(sql).length > 1;
+  return splitSqlStatementRanges(sql, databaseType).length > 1;
 }
 
 interface RawStatement {
@@ -89,6 +89,7 @@ const DATABASE_SOFT_STATEMENT_KEYWORDS: Partial<Record<DatabaseType, readonly st
   qdrant: [],
   milvus: [],
   weaviate: [],
+  chromadb: [],
   mq: [],
   etcd: [],
   zookeeper: [],
@@ -109,13 +110,15 @@ const INSERT_BODY_KEYWORDS = new Set(["SELECT", "WITH"]);
  * only the statement text (the trailing semicolon and inter-statement
  * whitespace are excluded so editor highlights stay tight).
  */
-export function splitSqlStatementRanges(sql: string): RawStatement[] {
+export function splitSqlStatementRanges(sql: string, databaseType?: DatabaseType): RawStatement[] {
   const statements: RawStatement[] = [];
   const len = sql.length;
+  const supportsDelimiterCommands = databaseType === "mysql";
 
   let statementStart = -1;
   let statementEnd = -1;
   let statementHitStart = 0;
+  let customDelimiter: string | null = null;
   let state: QuoteState = "none";
   let dollarTag = "";
   let i = 0;
@@ -127,9 +130,14 @@ export function splitSqlStatementRanges(sql: string): RawStatement[] {
     statementEnd = pos + 1;
   };
 
-  const flush = () => {
-    if (statementStart !== -1 && statementEnd !== -1 && statementEnd > statementStart) {
-      statements.push({ hitFrom: statementHitStart, from: statementStart, to: statementEnd, sql: sql.slice(statementStart, statementEnd) });
+  const flush = (to = statementEnd) => {
+    if (statementStart === -1) {
+      statementEnd = -1;
+      return;
+    }
+    const trimmedTo = trimRangeEnd(sql, statementStart, to);
+    if (trimmedTo > statementStart) {
+      statements.push({ hitFrom: statementHitStart, from: statementStart, to: trimmedTo, sql: sql.slice(statementStart, trimmedTo) });
     }
     statementStart = -1;
     statementEnd = -1;
@@ -214,6 +222,18 @@ export function splitSqlStatementRanges(sql: string): RawStatement[] {
     }
 
     // state === "none"
+    if (supportsDelimiterCommands && isAtLineStart(sql, i) && startsDelimiterCommand(sql, i)) {
+      const lineEnd = findLineEnd(sql, i);
+      const delimiter = parseDelimiterCommand(sql.slice(i, lineEnd));
+      if (delimiter !== null) {
+        flush();
+        customDelimiter = delimiter === ";" ? null : delimiter;
+        i = nextLineStart(sql, lineEnd);
+        statementHitStart = i;
+        continue;
+      }
+    }
+
     // Line comments consume up to (and including) the newline.
     if (ch === "-" && next === "-") {
       const newline = sql.indexOf("\n", i);
@@ -268,7 +288,14 @@ export function splitSqlStatementRanges(sql: string): RawStatement[] {
       }
     }
 
-    if (ch === ";") {
+    if (customDelimiter) {
+      if (sql.startsWith(customDelimiter, i)) {
+        flush(i);
+        i += customDelimiter.length;
+        statementHitStart = i;
+        continue;
+      }
+    } else if (ch === ";") {
       flush();
       statementHitStart = i + 1;
       i += 1;
@@ -298,7 +325,7 @@ export function statementRangeAtCursor(sql: string, cursorPos: number, databaseT
   const pos = clampCursor(sql, cursorPos);
   if (isCursorOnBlankLine(sql, pos)) return null;
 
-  const statements = splitSqlStatementRanges(sql);
+  const statements = splitSqlStatementRanges(sql, databaseType);
   for (let index = 0; index < statements.length; index += 1) {
     const statement = statements[index];
     const softRanges = splitStatementRangeAtSoftStarts(sql, statement, databaseType);
@@ -766,6 +793,40 @@ function isSqlWhitespace(ch: string): boolean {
   return ch === " " || ch === "\t" || ch === "\r" || ch === "\n";
 }
 
+function isAtLineStart(sql: string, pos: number): boolean {
+  for (let i = pos - 1; i >= 0; i -= 1) {
+    const ch = sql[i];
+    if (ch === "\n" || ch === "\r") return true;
+    if (ch !== " " && ch !== "\t") return false;
+  }
+  return true;
+}
+
+function startsDelimiterCommand(sql: string, pos: number): boolean {
+  const prefix = sql.slice(pos, pos + 9);
+  return prefix.toLowerCase() === "delimiter" && (sql[pos + 9] === " " || sql[pos + 9] === "\t");
+}
+
+function parseDelimiterCommand(line: string): string | null {
+  const match = /^delimiter[ \t]+(.+)$/i.exec(line.trim());
+  const delimiter = match?.[1]?.trim();
+  return delimiter ? delimiter : null;
+}
+
+function findLineEnd(sql: string, pos: number): number {
+  const newline = sql.indexOf("\n", pos);
+  const carriageReturn = sql.indexOf("\r", pos);
+  if (newline === -1) return carriageReturn === -1 ? sql.length : carriageReturn;
+  if (carriageReturn === -1) return newline;
+  return Math.min(newline, carriageReturn);
+}
+
+function nextLineStart(sql: string, lineEnd: number): number {
+  if (sql[lineEnd] === "\r" && sql[lineEnd + 1] === "\n") return lineEnd + 2;
+  if (sql[lineEnd] === "\n" || sql[lineEnd] === "\r") return lineEnd + 1;
+  return lineEnd;
+}
+
 function rangeFor(statement: RawStatement, sql: string): SqlTextRange {
   return {
     from: statement.from,
@@ -817,6 +878,11 @@ function normalizeSql(sql: string): string {
  * cursor statement and the full document are effectively the same SQL — in
  * that case only a single candidate is returned to avoid duplicates.
  */
+export function executableStatementRanges(sql: string, databaseType?: DatabaseType): SqlTextRange[] {
+  if (databaseType === "redis") return redisExecutableCommandRanges(sql);
+  return splitSqlStatementRanges(sql, databaseType).flatMap((statement) => splitStatementRangeAtSoftStarts(sql, statement, databaseType).map((range) => rangeFor(range, sql)));
+}
+
 export function buildExecutionCandidates(sql: string, cursorPos: number, databaseType?: DatabaseType): SqlExecutionCandidate[] {
   const full = fullSqlRange(sql);
   const cursorStatement = databaseType === "redis" ? redisCommandRangeAtCursor(sql, cursorPos) : statementRangeAtCursor(sql, cursorPos, databaseType);
@@ -850,13 +916,33 @@ function candidateFromRange(range: SqlTextRange, kind: SqlExecutionCandidate["ki
 
 function redisExecutableCommandCount(sql: string): number {
   let count = 0;
-  for (const line of sql.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
+  for (const range of redisExecutableCommandRanges(sql)) {
+    if (!range.sql.trim()) continue;
     count += 1;
     if (count > 1) return count;
   }
   return count;
+}
+
+function redisExecutableCommandRanges(sql: string): SqlTextRange[] {
+  const ranges: SqlTextRange[] = [];
+  let lineStart = 0;
+  while (lineStart <= sql.length) {
+    let lineEnd = sql.indexOf("\n", lineStart);
+    if (lineEnd === -1) lineEnd = sql.length;
+    const rawLine = sql.slice(lineStart, lineEnd);
+    const leadingWhitespace = rawLine.length - rawLine.trimStart().length;
+    const trailingWhitespace = rawLine.length - rawLine.trimEnd().length;
+    const trimmedLine = rawLine.trim();
+    if (trimmedLine && !trimmedLine.startsWith("#")) {
+      const from = lineStart + leadingWhitespace;
+      const to = lineStart + rawLine.length - trailingWhitespace;
+      ranges.push({ from, to, sql: sql.slice(from, to) });
+    }
+    if (lineEnd >= sql.length) break;
+    lineStart = lineEnd + 1;
+  }
+  return ranges;
 }
 
 function redisCommandRangeAtCursor(sql: string, cursorPos: number): SqlTextRange | null {

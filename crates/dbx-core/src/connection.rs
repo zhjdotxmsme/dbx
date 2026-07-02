@@ -11,8 +11,7 @@ use mysql_async::Row as MysqlRow;
 use crate::agent_connection::{
     agent_connect_params, h2_file_path_from_jdbc_url, is_h2_file_connection, mongo_legacy_error_with_auth_hint,
     mongo_uses_legacy_driver, oracle_alternate_connect_config_labels, oracle_alternate_connect_configs,
-    oracle_auth_fallback_profiles, oracle_error_with_driver_hint, should_retry_mongo_with_legacy_driver,
-    should_retry_oracle_with_10g_driver, trino_like_jdbc_connection_string,
+    oracle_error_with_driver_hint, should_retry_mongo_with_legacy_driver, trino_like_jdbc_connection_string,
 };
 use crate::agent_manager::{JavaRuntimeMode, DEFAULT_JRE_KEY};
 use crate::database_capabilities;
@@ -33,7 +32,7 @@ pub const JDBC_PLUGIN_NOT_INSTALLED: &str =
 pub const PRESTOSQL_JDBC_DRIVER_CLASS: &str = "io.prestosql.jdbc.PrestoDriver";
 const DEFAULT_AGENT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const ACCESS_AGENT_CONNECT_TIMEOUT_SECS: u64 = 30;
-const POOL_CLOSE_TIMEOUT_SECS: u64 = 5;
+const POOL_CLOSE_TIMEOUT_SECS: u64 = 3;
 
 #[cfg(feature = "duckdb-bundled")]
 mod duckdb_types {
@@ -54,6 +53,19 @@ pub enum MysqlMode {
     Normal,
     Bare,
     OceanBaseOracle,
+}
+
+fn is_oceanbase_mysql_config(config: &ConnectionConfig) -> bool {
+    config.db_type == DatabaseType::Mysql
+        && config.driver_profile.as_deref().is_some_and(|profile| profile.eq_ignore_ascii_case("oceanbase"))
+}
+
+fn oceanbase_mysql_setup_queries(config: &ConnectionConfig) -> Vec<String> {
+    if !is_oceanbase_mysql_config(config) || config.query_timeout_secs == 0 {
+        return Vec::new();
+    }
+    let timeout_us = config.query_timeout_secs.saturating_mul(1_000_000);
+    vec![format!("SET ob_query_timeout = {timeout_us}")]
 }
 
 pub enum PoolKind {
@@ -136,6 +148,9 @@ pub struct AppState {
     pub plugins: PluginRegistry,
     pub agent_manager: crate::agent_manager::AgentManager,
     pub nacos_registry: crate::nacos::NacosAdminRegistry,
+    /// PostgreSQL TLS cancel context, keyed by pool_key.
+    /// Used to reconstruct a TLS connector compatible with the original connection when cancelling.
+    postgres_cancel_contexts: Arc<RwLock<HashMap<String, db::postgres::PostgresCancelContext>>>,
     #[cfg(feature = "mq-admin")]
     pub mq_registry: crate::mq::MqAdminRegistry,
 }
@@ -214,8 +229,17 @@ pub async fn connect_mysql_metadata_pool(
     max_connections: usize,
 ) -> Result<(db::mysql::MySqlPool, MysqlMode), String> {
     let url = connection_url_for_endpoint(db_config, host, port);
+    let idle_timeout_secs = Some(db_config.idle_timeout_secs);
+    let extra_setup_queries = oceanbase_mysql_setup_queries(db_config);
     if db_config.needs_bare_mysql() {
-        return match db::mysql::connect_bare_with_pool_limit(&url, connect_timeout, max_connections).await {
+        return match db::mysql::connect_bare_with_pool_limit_and_setup(
+            &url,
+            connect_timeout,
+            max_connections,
+            &extra_setup_queries,
+        )
+        .await
+        {
             Ok(pool) => Ok((pool, MysqlMode::Bare)),
             Err(err) => {
                 let fallback_url = mysql_metadata_fallback_url(config, db_config, host, port);
@@ -223,9 +247,14 @@ pub async fn connect_mysql_metadata_pool(
                     log::info!(
                         "MySQL metadata connection without a default database failed ({err}); retrying with configured default database."
                     );
-                    db::mysql::connect_bare_with_pool_limit(&fallback_url, connect_timeout, max_connections)
-                        .await
-                        .map(|pool| (pool, MysqlMode::Bare))
+                    db::mysql::connect_bare_with_pool_limit_and_setup(
+                        &fallback_url,
+                        connect_timeout,
+                        max_connections,
+                        &extra_setup_queries,
+                    )
+                    .await
+                    .map(|pool| (pool, MysqlMode::Bare))
                 } else {
                     Err(err)
                 }
@@ -233,11 +262,13 @@ pub async fn connect_mysql_metadata_pool(
         };
     }
 
-    match db::mysql::connect_with_ca_cert_and_pool_limit(
+    match db::mysql::connect_with_ca_cert_pool_limit_idle_and_setup(
         &url,
         Some(&db_config.ca_cert_path),
         connect_timeout,
         max_connections,
+        idle_timeout_secs,
+        &extra_setup_queries,
     )
     .await
     {
@@ -251,11 +282,13 @@ pub async fn connect_mysql_metadata_pool(
                 log::info!(
                     "MySQL metadata connection without a default database failed ({err}); retrying with configured default database."
                 );
-                let pool = db::mysql::connect_with_ca_cert_and_pool_limit(
+                let pool = db::mysql::connect_with_ca_cert_pool_limit_idle_and_setup(
                     &fallback_url,
                     Some(&config.ca_cert_path),
                     connect_timeout,
                     max_connections,
+                    idle_timeout_secs,
+                    &extra_setup_queries,
                 )
                 .await?;
                 let mode = detect_ob_oracle_mode(config, &pool).await;
@@ -275,19 +308,38 @@ pub async fn connect_bare_metadata_pool(
     max_connections: usize,
 ) -> Result<db::mysql::MySqlPool, String> {
     let url = connection_url_for_endpoint(db_config, host, port);
+    let extra_setup_queries = oceanbase_mysql_setup_queries(db_config);
     if db_config.effective_database().is_none() {
-        return db::mysql::connect_bare_with_pool_limit(&url, connect_timeout, max_connections).await;
+        return db::mysql::connect_bare_with_pool_limit_and_setup(
+            &url,
+            connect_timeout,
+            max_connections,
+            &extra_setup_queries,
+        )
+        .await;
     }
 
     let mut unscoped_config = db_config.clone();
     unscoped_config.database = None;
     let unscoped_url = connection_url_for_endpoint(&unscoped_config, host, port);
     if unscoped_url == url {
-        return db::mysql::connect_bare_with_pool_limit(&url, connect_timeout, max_connections).await;
+        return db::mysql::connect_bare_with_pool_limit_and_setup(
+            &url,
+            connect_timeout,
+            max_connections,
+            &extra_setup_queries,
+        )
+        .await;
     }
 
-    let preferred = db::mysql::connect_bare_with_pool_limit(&url, connect_timeout, max_connections);
-    let unscoped = db::mysql::connect_bare_with_pool_limit(&unscoped_url, connect_timeout, max_connections);
+    let preferred =
+        db::mysql::connect_bare_with_pool_limit_and_setup(&url, connect_timeout, max_connections, &extra_setup_queries);
+    let unscoped = db::mysql::connect_bare_with_pool_limit_and_setup(
+        &unscoped_url,
+        connect_timeout,
+        max_connections,
+        &extra_setup_queries,
+    );
     tokio::pin!(preferred);
     tokio::pin!(unscoped);
 
@@ -365,6 +417,7 @@ impl AppState {
                 app_version,
             ),
             nacos_registry: crate::nacos::NacosAdminRegistry::new(),
+            postgres_cancel_contexts: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(feature = "mq-admin")]
             mq_registry: crate::mq::MqAdminRegistry::new(),
         }
@@ -420,9 +473,10 @@ impl AppState {
         self.stop_keepalive_task(&pool_key).await;
         self.pool_activity.write().await.insert(pool_key.clone(), PoolActivity::now());
         self.start_keepalive_task(&pool_key, &pool, config).await;
+        let previous_key = pool_key.clone();
         let previous = self.connections.write().await.insert(pool_key, pool);
         if let Some(pool) = previous {
-            close_pool_kind(pool).await;
+            close_pool_kind_with_timeout(previous_key, pool).await;
         }
     }
 
@@ -461,7 +515,7 @@ impl AppState {
         config: &ConnectionConfig,
     ) -> Result<(), String> {
         if let Err(err) = self.ensure_current_connection_attempt(connection_id, Some(attempt)).await {
-            close_pool_kind(pool).await;
+            close_pool_kind_with_timeout(pool_key, pool).await;
             return Err(err);
         }
         self.insert_connection_pool(pool_key, pool, config).await;
@@ -495,6 +549,7 @@ impl AppState {
         let connections = self.connections.clone();
         let keepalive_tasks = self.keepalive_tasks.clone();
         let pool_activity = self.pool_activity.clone();
+        let cancel_contexts = self.postgres_cancel_contexts.clone();
         let running_queries = self.running_queries.clone();
         let idle_timeout = Duration::from_secs(idle_timeout_secs.max(1));
         let handle = tokio::spawn(async move {
@@ -517,6 +572,7 @@ impl AppState {
                         );
                         keepalive_tasks.write().await.remove(&key);
                         pool_activity.write().await.remove(&key);
+                        cancel_contexts.write().await.remove(&key);
                         let removed = connections.write().await.remove(&key);
                         if let Some(pool) = removed {
                             close_pool_kind_with_timeout(key, pool).await;
@@ -533,6 +589,7 @@ impl AppState {
                             log::warn!("Connection keepalive failed for '{key}': {err}; invalidating pool");
                             keepalive_tasks.write().await.remove(&key);
                             pool_activity.write().await.remove(&key);
+                            cancel_contexts.write().await.remove(&key);
                             let removed = connections.write().await.remove(&key);
                             if let Some(pool) = removed {
                                 close_pool_kind_with_timeout(key, pool).await;
@@ -546,6 +603,7 @@ impl AppState {
                             );
                             keepalive_tasks.write().await.remove(&key);
                             pool_activity.write().await.remove(&key);
+                            cancel_contexts.write().await.remove(&key);
                             let removed = connections.write().await.remove(&key);
                             if let Some(pool) = removed {
                                 close_pool_kind_with_timeout(key, pool).await;
@@ -580,6 +638,11 @@ impl AppState {
 
     pub async fn touch_pool_activity(&self, pool_key: &str) {
         self.pool_activity.write().await.insert(pool_key.to_string(), PoolActivity::now());
+    }
+
+    /// Get the PostgreSQL TLS cancel context (used to reconstruct the TLS connector when cancelling a query).
+    pub async fn get_postgres_cancel_context(&self, pool_key: &str) -> Option<db::postgres::PostgresCancelContext> {
+        self.postgres_cancel_contexts.read().await.get(pool_key).cloned()
     }
 
     pub fn pool_activity_touch(&self, pool_key: &str) -> PoolActivityTouch {
@@ -678,7 +741,14 @@ impl AppState {
             | DatabaseType::Gaussdb
             | DatabaseType::Kwdb
             | DatabaseType::Questdb
-            | DatabaseType::OpenGauss => PoolKind::Postgres(db::postgres::connect(&url, connect_timeout).await?),
+            | DatabaseType::OpenGauss => {
+                let pg_pool = db::postgres::connect(&url, connect_timeout).await?;
+                // Build TLS cancel context for reconstructing TLS connection during cancel
+                if let Some(ctx) = db::postgres::build_postgres_cancel_context(&url) {
+                    self.postgres_cancel_contexts.write().await.insert(pool_key.clone(), ctx);
+                }
+                PoolKind::Postgres(pg_pool)
+            }
             DatabaseType::Sqlite => {
                 let extensions = db::sqlite::sqlite_extension_specs_from_url_params(db_config.url_params.as_deref())
                     .into_iter()
@@ -688,11 +758,7 @@ impl AppState {
                     })
                     .collect();
                 PoolKind::Sqlite(
-                    db::sqlite::connect_path_create_if_missing_with_extensions(
-                        &expand_tilde(&db_config.host),
-                        extensions,
-                    )
-                    .await?,
+                    db::sqlite::connect_path_with_extensions(&expand_tilde(&db_config.host), extensions).await?,
                 )
             }
             DatabaseType::Rqlite => {
@@ -832,11 +898,12 @@ impl AppState {
                 db::elasticsearch_driver::test_connection(&mut client, connect_timeout).await?;
                 PoolKind::Elasticsearch(client)
             }
-            DatabaseType::Qdrant | DatabaseType::Milvus | DatabaseType::Weaviate => {
+            DatabaseType::Qdrant | DatabaseType::Milvus | DatabaseType::Weaviate | DatabaseType::ChromaDb => {
                 let kind = match db_config.db_type {
                     DatabaseType::Qdrant => db::vector_driver::VectorDbKind::Qdrant,
                     DatabaseType::Milvus => db::vector_driver::VectorDbKind::Milvus,
                     DatabaseType::Weaviate => db::vector_driver::VectorDbKind::Weaviate,
+                    DatabaseType::ChromaDb => db::vector_driver::VectorDbKind::ChromaDb,
                     _ => unreachable!(),
                 };
                 let client = db::vector_driver::VectorClient::new(
@@ -857,6 +924,7 @@ impl AppState {
                     &url,
                     username,
                     password,
+                    db_config.url_params.clone(),
                     Some(&db_config.ca_cert_path),
                     connect_timeout,
                 )?;
@@ -877,7 +945,7 @@ impl AppState {
                 let connect_result = client
                     .call_method_with_timeout::<serde_json::Value>(
                         AgentMethod::Connect,
-                        connect_params.clone(),
+                        connect_params,
                         Some(agent_connect_timeout(&db_config)),
                     )
                     .await;
@@ -925,45 +993,6 @@ impl AppState {
                                 fallback_errors.join("\n")
                             ));
                         }
-                    } else if should_retry_oracle_with_10g_driver(&db_config, &err) {
-                        log::warn!(
-                            "Oracle connect failed with profile {:?}: {}. Retrying with legacy Oracle profiles.",
-                            db_config.driver_profile,
-                            err
-                        );
-                        let mut fallback_errors = Vec::new();
-                        let mut connected_client = None;
-                        for profile in oracle_auth_fallback_profiles(&db_config, &err) {
-                            match self.agent_manager.spawn(&db_config.db_type, Some(profile)).await {
-                                Ok(mut fallback_client) => {
-                                    match fallback_client
-                                        .call_method_with_timeout::<serde_json::Value>(
-                                            AgentMethod::Connect,
-                                            connect_params.clone(),
-                                            Some(agent_connect_timeout(&db_config)),
-                                        )
-                                        .await
-                                    {
-                                        Ok(_) => {
-                                            connected_client = Some(fallback_client);
-                                            break;
-                                        }
-                                        Err(fallback_err) => {
-                                            fallback_errors.push(format!("{profile}: {fallback_err}"));
-                                        }
-                                    }
-                                }
-                                Err(fallback_err) => {
-                                    fallback_errors.push(format!("{profile}: {fallback_err}"));
-                                }
-                            }
-                        }
-                        client = connected_client.ok_or_else(|| {
-                            format!(
-                                "{err}\n\nFallback with legacy Oracle drivers failed: {}",
-                                fallback_errors.join("\n")
-                            )
-                        })?;
                     } else {
                         return Err(oracle_error_with_driver_hint(&db_config, &err));
                     }
@@ -1003,7 +1032,7 @@ impl AppState {
         };
 
         if let Err(err) = self.ensure_current_connection_attempt(connection_id, connection_attempt).await {
-            close_pool_kind(pool).await;
+            close_pool_kind_with_timeout(pool_key.clone(), pool).await;
             return Err(err);
         }
         self.insert_connection_pool(pool_key.clone(), pool, &db_config).await;
@@ -1117,7 +1146,7 @@ impl AppState {
         }
 
         let (host, port) = self.connection_host_port(connection_id, config).await?;
-        Ok(nacos_config.with_connect_override(&host, port))
+        nacos_config.with_server_endpoint(&host, port)
     }
 
     async fn remove_stale_connection_pool(&self, pool_key: &str) -> bool {
@@ -1314,9 +1343,10 @@ impl AppState {
 
         self.stop_keepalive_task(pool_key).await;
         self.pool_activity.write().await.remove(pool_key);
+        self.postgres_cancel_contexts.write().await.remove(pool_key);
         let removed = self.connections.write().await.remove(pool_key);
         if let Some(pool) = removed {
-            close_pool_kind(pool).await;
+            close_pool_kind_with_timeout(pool_key.to_string(), pool).await;
             true
         } else {
             false
@@ -1345,9 +1375,10 @@ impl AppState {
         } else {
             self.stop_keepalive_task(&pool_key).await;
             self.pool_activity.write().await.remove(&pool_key);
+            self.postgres_cancel_contexts.write().await.remove(&pool_key);
             let removed = self.connections.write().await.remove(&pool_key);
             if let Some(pool) = removed {
-                close_pool_kind(pool).await;
+                close_pool_kind_with_timeout(pool_key.clone(), pool).await;
             }
         }
         self.get_or_create_pool_for_session(connection_id, database, client_session_id).await
@@ -1374,9 +1405,10 @@ impl AppState {
         }
         self.stop_keepalive_task(&pool_key).await;
         self.pool_activity.write().await.remove(&pool_key);
+        self.postgres_cancel_contexts.write().await.remove(&pool_key);
         let removed = self.connections.write().await.remove(&pool_key);
         if let Some(pool) = removed {
-            close_pool_kind(pool).await;
+            close_pool_kind_with_timeout(pool_key, pool).await;
             Ok(true)
         } else {
             Ok(false)
@@ -1386,9 +1418,10 @@ impl AppState {
     pub async fn remove_pool_by_key(&self, pool_key: &str) -> bool {
         self.stop_keepalive_task(pool_key).await;
         self.pool_activity.write().await.remove(pool_key);
+        self.postgres_cancel_contexts.write().await.remove(pool_key);
         let removed = self.connections.write().await.remove(pool_key);
         if let Some(pool) = removed {
-            close_pool_kind(pool).await;
+            close_pool_kind_with_timeout(pool_key.to_string(), pool).await;
             true
         } else {
             false
@@ -1416,21 +1449,23 @@ impl AppState {
         self.stop_keepalive_tasks(&keys_to_remove).await;
         {
             let mut activity = self.pool_activity.write().await;
+            let mut cancel_contexts = self.postgres_cancel_contexts.write().await;
             for key in &keys_to_remove {
                 activity.remove(key);
+                cancel_contexts.remove(key);
             }
         }
         let mut conns = self.connections.write().await;
         let mut removed = Vec::with_capacity(keys_to_remove.len());
         for key in keys_to_remove {
             if let Some(pool) = conns.remove(&key) {
-                removed.push(pool);
+                removed.push((key, pool));
             }
         }
         drop(conns);
         let closed = !removed.is_empty();
-        for pool in removed {
-            close_pool_kind(pool).await;
+        for (key, pool) in removed {
+            close_pool_kind_with_timeout(key, pool).await;
         }
         Ok(closed)
     }
@@ -1718,11 +1753,14 @@ impl AppState {
                 }
             }
             let mut conns = self.connections.write().await;
+            let mut removed = Vec::with_capacity(dead_keys.len());
             for key in &dead_keys {
                 if let Some(pool) = conns.remove(key) {
-                    close_pool_kind(pool).await;
+                    removed.push((key.clone(), pool));
                 }
             }
+            drop(conns);
+            close_removed_pools(removed).await;
         }
 
         // Re-establish SSH tunnels that have died
@@ -1764,8 +1802,10 @@ impl AppState {
         self.stop_keepalive_tasks(&keys_to_remove).await;
         {
             let mut activity = self.pool_activity.write().await;
+            let mut cancel_contexts = self.postgres_cancel_contexts.write().await;
             for key in &keys_to_remove {
                 activity.remove(key);
+                cancel_contexts.remove(key);
             }
         }
         let mut conns = self.connections.write().await;
@@ -2140,7 +2180,11 @@ fn base_pool_key_for(
             || (include_elasticsearch_single_pool
                 && matches!(
                     db_type,
-                    DatabaseType::Elasticsearch | DatabaseType::Qdrant | DatabaseType::Milvus | DatabaseType::Weaviate
+                    DatabaseType::Elasticsearch
+                        | DatabaseType::Qdrant
+                        | DatabaseType::Milvus
+                        | DatabaseType::Weaviate
+                        | DatabaseType::ChromaDb
                 ));
         is_single && (!database_capabilities::is_agent_type(db_type) || shares_database_pool_with_connection(db_type))
     });
@@ -2355,13 +2399,13 @@ async fn detect_ob_oracle_mode(config: &ConnectionConfig, pool: &db::mysql::MySq
 mod tests {
     use super::{
         agent_connect_timeout, connection_remote_endpoint, connection_url_for_endpoint, database_connection_config,
-        metadata_connection_config, mysql_metadata_fallback_url, prestosql_jdbc_config_for_endpoint,
-        redacted_connection_url_for_endpoint, uses_bare_mysql_pool, uses_tcp_probe, validate_h2_database_path,
-        AppState, PoolKind, PRESTOSQL_JDBC_DRIVER_CLASS,
+        metadata_connection_config, mysql_metadata_fallback_url, oceanbase_mysql_setup_queries,
+        prestosql_jdbc_config_for_endpoint, redacted_connection_url_for_endpoint, uses_bare_mysql_pool, uses_tcp_probe,
+        validate_h2_database_path, AppState, PoolKind, PRESTOSQL_JDBC_DRIVER_CLASS,
     };
     use crate::agent_connection::{
         agent_connect_params, mongo_legacy_error_with_auth_hint, mongo_uses_legacy_driver,
-        oracle_alternate_connect_config, should_retry_mongo_with_legacy_driver, should_retry_oracle_with_10g_driver,
+        oracle_alternate_connect_config, should_retry_mongo_with_legacy_driver,
     };
     use crate::agent_manager::{AgentState, JavaRuntimeConfig, JavaRuntimeMode, DEFAULT_JRE_KEY};
     use crate::database_capabilities;
@@ -2411,6 +2455,7 @@ mod tests {
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
             redis_key_separator: default_redis_key_separator(),
+            redis_scan_page_size: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -2559,6 +2604,32 @@ mod tests {
     }
 
     #[test]
+    fn oceanbase_mysql_setup_queries_follow_query_timeout() {
+        let mut config = mysql_config(Some("dbx"));
+        config.driver_profile = Some("oceanbase".to_string());
+        config.query_timeout_secs = 30;
+
+        assert_eq!(oceanbase_mysql_setup_queries(&config), vec!["SET ob_query_timeout = 30000000"]);
+    }
+
+    #[test]
+    fn oceanbase_mysql_setup_queries_skip_disabled_timeout() {
+        let mut config = mysql_config(Some("dbx"));
+        config.driver_profile = Some("oceanbase".to_string());
+        config.query_timeout_secs = 0;
+
+        assert!(oceanbase_mysql_setup_queries(&config).is_empty());
+    }
+
+    #[test]
+    fn oceanbase_mysql_setup_queries_do_not_apply_to_plain_mysql() {
+        let mut config = mysql_config(Some("dbx"));
+        config.query_timeout_secs = 30;
+
+        assert!(oceanbase_mysql_setup_queries(&config).is_empty());
+    }
+
+    #[test]
     fn mongo_legacy_retry_covers_old_server_handshake_eof() {
         let err = r#"MongoDB connection failed: Kind: Server selection timeout: No available servers. Topology: { Type: Unknown, Servers: [ { Address: db.example.com:27017, Type: Unknown, Error: Kind: I/O error: unexpected end of file } ] }"#;
 
@@ -2655,33 +2726,6 @@ mod tests {
     }
 
     #[test]
-    fn oracle_retry_guard_only_triggers_for_non_10g_listener_errors() {
-        let mut config = mysql_config(Some("ORCL"));
-        config.db_type = DatabaseType::Oracle;
-        config.driver_profile = Some("oracle".to_string());
-
-        assert!(!should_retry_oracle_with_10g_driver(
-            &config,
-            "Agent RPC error (-1): ORA-28040: No matching authentication protocol"
-        ));
-        assert!(!should_retry_oracle_with_10g_driver(&config, "Agent RPC error (-1): ORA-12541: TNS:no listener"));
-        assert!(!should_retry_oracle_with_10g_driver(&config, "host xxx port 1521 中没有监听程序"));
-
-        config.driver_profile = Some("oracle-10g".to_string());
-        assert!(!should_retry_oracle_with_10g_driver(&config, "Agent RPC error (-1): ORA-12541: TNS:no listener"));
-        assert!(!should_retry_oracle_with_10g_driver(
-            &config,
-            "Agent RPC error (-1): ORA-28040: No matching authentication protocol"
-        ));
-
-        config.driver_profile = Some("oracle".to_string());
-        assert!(!should_retry_oracle_with_10g_driver(
-            &config,
-            "Agent RPC error (-1): ORA-01017: invalid username/password"
-        ));
-    }
-
-    #[test]
     fn oracle_listener_errors_can_retry_with_alternate_connect_descriptor() {
         let mut config = mysql_config(Some("ORCL"));
         config.db_type = DatabaseType::Oracle;
@@ -2709,15 +2753,12 @@ mod tests {
     }
 
     #[test]
-    fn oracle_alternate_descriptor_retry_skips_non_listener_errors_and_10g_profiles() {
+    fn oracle_alternate_descriptor_retry_skips_non_listener_errors() {
         let mut config = mysql_config(Some("ORCL"));
         config.db_type = DatabaseType::Oracle;
         config.driver_profile = Some("oracle".to_string());
 
         assert!(oracle_alternate_connect_config(&config, "ORA-01017: invalid username/password").is_none());
-
-        config.driver_profile = Some("oracle-10g".to_string());
-        assert!(oracle_alternate_connect_config(&config, "ORA-12514: listener does not know service").is_none());
     }
 
     #[test]
@@ -3336,6 +3377,7 @@ mod tests {
     async fn duckdb_client_session_reuses_base_pool_to_avoid_file_locks() {
         let (state, dir) = test_app_state().await;
         let db_path = dir.join("session.duckdb");
+        duckdb::Connection::open(&db_path).unwrap();
         let mut config = mysql_config(None);
         config.id = "duckdb-conn".to_string();
         config.name = "DuckDB".to_string();
@@ -3476,6 +3518,40 @@ mod tests {
 
         assert_eq!(nacos_config.server_addr, "https://nacos.aliyuncs.com:8848");
         assert!(nacos_config.connect_override.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn nacos_admin_config_rewrites_server_addr_to_forwarded_endpoint() {
+        let (state, dir) = test_app_state().await;
+        let mut config = mysql_config(None);
+        config.id = "proxied-nacos".to_string();
+        config.db_type = DatabaseType::Nacos;
+        config.host = "192.168.2.51".to_string();
+        config.port = 10840;
+        config.external_config = Some(serde_json::json!({
+            "serverAddr": "http://192.168.2.51:10840",
+            "namespace": "public",
+            "contextPath": "",
+            "auth": { "kind": "none" }
+        }));
+        config.transport_layers = vec![TransportLayerConfig::Proxy(ProxyTunnelConfig {
+            id: "proxy".to_string(),
+            name: String::new(),
+            enabled: true,
+            proxy_type: ProxyType::Socks5,
+            host: "127.0.0.1".to_string(),
+            port: 65000,
+            username: String::new(),
+            password: String::new(),
+        })];
+
+        let nacos_config = state.nacos_admin_config_for_connection("proxied-nacos", &config).await.unwrap();
+
+        assert!(nacos_config.server_addr.starts_with("http://127.0.0.1:"));
+        assert_ne!(nacos_config.server_addr, "http://192.168.2.51:10840");
+        assert!(nacos_config.connect_override.is_none());
+        state.proxy_tunnels.stop_tunnel("proxied-nacos:transport:0").await;
         let _ = std::fs::remove_dir_all(dir);
     }
 

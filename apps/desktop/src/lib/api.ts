@@ -1,6 +1,7 @@
 import { isTauriRuntime } from "./tauriRuntime";
 import type * as TauriModule from "./tauri";
 import { appendDebugLog } from "./debugLog";
+import { apiWebSocketUrl } from "./webPath";
 
 // ---------------------------------------------------------------------------
 // Lazy backend resolution (avoids top-level await)
@@ -92,6 +93,7 @@ export const reinstallJre = forward("reinstallJre");
 export const uninstallJre = forward("uninstallJre");
 export const listenAgentInstallProgress = forward("listenAgentInstallProgress");
 export const loadSavedSqlLibrary = forward("loadSavedSqlLibrary");
+export const loadSavedSqlFile = forward("loadSavedSqlFile");
 export const saveSavedSqlFolder = forward("saveSavedSqlFolder");
 export const deleteSavedSqlFolder = forward("deleteSavedSqlFolder");
 export const saveSavedSqlFile = forward("saveSavedSqlFile");
@@ -122,6 +124,7 @@ export const listCompletionObjects = forward("listCompletionObjects");
 export const completionAssistantSearch = forward("completionAssistantSearch");
 export const getObjectSource = forward("getObjectSource");
 export const getColumns = forward("getColumns");
+export const listDataTypes = forward("listDataTypes");
 export const listIndexes = forward("listIndexes");
 export const listForeignKeys = forward("listForeignKeys");
 export const listTriggers = forward("listTriggers");
@@ -179,6 +182,8 @@ export const buildDataGridCopyUpdateStatements = forward("buildDataGridCopyUpdat
 export const buildDataGridCopyInsertStatement = forward("buildDataGridCopyInsertStatement");
 export const buildDataGridContextFilterCondition = forward("buildDataGridContextFilterCondition");
 export const buildDataGridColumnValueFilterCondition = forward("buildDataGridColumnValueFilterCondition");
+export const buildDataGridColumnValuesFilterCondition = forward("buildDataGridColumnValuesFilterCondition");
+export const buildDataGridColumnDistinctValuesSql = forward("buildDataGridColumnDistinctValuesSql");
 export const buildDataGridCountSql = forward("buildDataGridCountSql");
 export const buildHiveTablePropertiesSql = forward("buildHiveTablePropertiesSql");
 export const buildExportInsertStatements = forward("buildExportInsertStatements");
@@ -301,8 +306,7 @@ export const redisSlowlogGet = forward("redisSlowlogGet");
 export const redisClusterMasterNodes = forward("redisClusterMasterNodes");
 
 export function redisPubSubConnect(connectionId: string): WebSocket {
-  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return new WebSocket(`${protocol}//${window.location.host}/api/redis/pubsub/ws?connectionId=${encodeURIComponent(connectionId)}`);
+  return new WebSocket(apiWebSocketUrl(`/api/redis/pubsub/ws?connectionId=${encodeURIComponent(connectionId)}`));
 }
 
 // etcd
@@ -367,6 +371,7 @@ export const mongoDropDatabase = forward("mongoDropDatabase");
 export const mongoDropCollection = forward("mongoDropCollection");
 export const documentFindDocuments = forward("documentFindDocuments");
 export const mongoFindDocuments = forward("mongoFindDocuments");
+export const mongoServerVersion = forward("mongoServerVersion");
 export const mongoAggregateDocuments = forward("mongoAggregateDocuments");
 export const mongoInsertDocument = forward("mongoInsertDocument");
 export const mongoInsertDocuments = forward("mongoInsertDocuments");
@@ -392,6 +397,7 @@ export const checkMcpServerStatus = forward("checkMcpServerStatus");
 export const installMcpServer = forward("installMcpServer");
 export const checkForUpdates = forward("checkForUpdates");
 export const getSystemProxyUrl = forward("getSystemProxyUrl");
+export const downloadAndInstallUpdate = forward("downloadAndInstallUpdate");
 export const getAppVersion = forward("getAppVersion");
 
 // Layout
@@ -405,6 +411,7 @@ export const loadSidebarLayout = forward("loadSidebarLayout");
 export type {
   AiMessage,
   AiCompletionRequest,
+  AiTaskContract,
   AiStreamChunk,
   AiModelInfo,
   AiChatMessage,
@@ -440,6 +447,7 @@ export type {
   KvKeyMetadata,
   KvKeySummary,
   KvListPrefixResponse,
+  KvListPrefixOptions,
   KvGetResponse,
   KvWriteMode,
   KvCreateMode,

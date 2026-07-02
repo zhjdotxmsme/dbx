@@ -67,6 +67,8 @@ pub struct ConnectionConfig {
     pub redis_cluster_nodes: String,
     #[serde(default = "default_redis_key_separator", skip_serializing_if = "is_default_redis_separator")]
     pub redis_key_separator: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redis_scan_page_size: Option<u64>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub etcd_endpoints: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -209,7 +211,7 @@ pub fn default_idle_timeout_secs() -> u64 {
 }
 
 pub fn default_keepalive_interval_secs() -> u64 {
-    60
+    30
 }
 
 fn default_proxy_port() -> u16 {
@@ -263,6 +265,8 @@ pub enum DatabaseType {
     Milvus,
     #[serde(rename = "weaviate")]
     Weaviate,
+    #[serde(rename = "chromadb")]
+    ChromaDb,
     Doris,
     #[serde(rename = "starrocks")]
     StarRocks,
@@ -395,6 +399,8 @@ struct ConnectionConfigData {
     #[serde(default = "default_redis_key_separator")]
     pub redis_key_separator: String,
     #[serde(default)]
+    pub redis_scan_page_size: Option<u64>,
+    #[serde(default)]
     pub etcd_endpoints: String,
     #[serde(default)]
     pub gbase_server: String,
@@ -450,6 +456,7 @@ impl From<ConnectionConfigData> for ConnectionConfig {
             redis_sentinel_tls: data.redis_sentinel_tls,
             redis_cluster_nodes: data.redis_cluster_nodes,
             redis_key_separator: data.redis_key_separator,
+            redis_scan_page_size: data.redis_scan_page_size,
             etcd_endpoints: data.etcd_endpoints,
             gbase_server: data.gbase_server,
             informix_server: data.informix_server,
@@ -740,10 +747,15 @@ impl ConnectionConfig {
                         suffix.push_str("&directConnection=true");
                     }
                 }
+                let db_part = mongo_uri_db_part_for_suffix(&db_part, &suffix);
                 format!("mongodb://{host}:{port}{db_part}{suffix}")
             }
             DatabaseType::Oracle => format!("oracle://{host}:{port}{db_part}"),
-            DatabaseType::Elasticsearch | DatabaseType::Qdrant | DatabaseType::Milvus | DatabaseType::Weaviate => {
+            DatabaseType::Elasticsearch
+            | DatabaseType::Qdrant
+            | DatabaseType::Milvus
+            | DatabaseType::Weaviate
+            | DatabaseType::ChromaDb => {
                 let scheme = if self.ssl { "https" } else { "http" };
                 format!("{scheme}://{host}:{port}")
             }
@@ -873,6 +885,7 @@ impl ConnectionConfig {
                         suffix.push_str("&directConnection=true");
                     }
                 }
+                let db_part = mongo_uri_db_part_for_suffix(&db_part, &suffix);
                 if self.username.is_empty() {
                     format!("mongodb://{host}:{port}{db_part}{suffix}")
                 } else {
@@ -882,7 +895,11 @@ impl ConnectionConfig {
             DatabaseType::Oracle => {
                 format!("oracle://{}:{}@{host}:{port}{db_part}", username, password)
             }
-            DatabaseType::Elasticsearch | DatabaseType::Qdrant | DatabaseType::Milvus | DatabaseType::Weaviate => {
+            DatabaseType::Elasticsearch
+            | DatabaseType::Qdrant
+            | DatabaseType::Milvus
+            | DatabaseType::Weaviate
+            | DatabaseType::ChromaDb => {
                 let scheme = if self.ssl { "https" } else { "http" };
                 format!("{scheme}://{host}:{port}")
             }
@@ -1065,7 +1082,7 @@ impl ConnectionConfig {
             }
             DatabaseType::Databend => normalize_bare_mysql_url_params(value),
             DatabaseType::Postgres | DatabaseType::Redshift => normalize_postgres_url_params(value, self.ssl),
-            DatabaseType::MongoDb => normalize_mongo_url_params(value, self.ssl),
+            DatabaseType::MongoDb => normalize_mongo_url_params(value, self.ssl, !self.username.trim().is_empty()),
             _ => value.trim_start_matches('?').to_string(),
         }
     }
@@ -1155,7 +1172,7 @@ fn normalize_mysql_url_params(value: &str, force_tls: bool, accept_invalid_certs
     parts.join("&")
 }
 
-fn normalize_mongo_url_params(value: &str, force_tls: bool) -> String {
+fn normalize_mongo_url_params(value: &str, force_tls: bool, default_auth_source: bool) -> String {
     let value = value.trim_start_matches('?');
     let mut parts: Vec<String> = value.split('&').filter(|part| !part.is_empty()).map(str::to_string).collect();
 
@@ -1164,18 +1181,31 @@ fn normalize_mongo_url_params(value: &str, force_tls: bool) -> String {
         parts.insert(0, "tls=true".to_string());
     }
 
+    if default_auth_source && !parts.iter().any(|part| url_param_key_is(part, "authSource")) {
+        parts.push("authSource=admin".to_string());
+    }
+
     parts.join("&")
 }
 
+fn mongo_uri_db_part_for_suffix<'a>(db_part: &'a str, suffix: &str) -> &'a str {
+    if db_part.is_empty() && !suffix.is_empty() {
+        "/"
+    } else {
+        db_part
+    }
+}
+
 fn normalize_mongo_uri_direct_connection(uri: &str) -> String {
-    if !mongo_uri_has_multiple_seeds(uri) || !mongo_uri_has_direct_connection_true(uri) {
-        return uri.to_string();
+    let uri = normalize_mongo_uri_query_path(uri);
+    if !mongo_uri_has_multiple_seeds(&uri) || !mongo_uri_has_direct_connection_true(&uri) {
+        return uri;
     }
 
     let (before_fragment, fragment) =
-        uri.split_once('#').map(|(base, fragment)| (base, Some(fragment))).unwrap_or((uri, None));
+        uri.split_once('#').map(|(base, fragment)| (base, Some(fragment))).unwrap_or((uri.as_str(), None));
     let Some((base, query)) = before_fragment.split_once('?') else {
-        return uri.to_string();
+        return uri;
     };
     let params =
         query.split('&').filter(|part| !mongo_url_param_is_direct_connection_true(part)).collect::<Vec<_>>().join("&");
@@ -1186,6 +1216,26 @@ fn normalize_mongo_uri_direct_connection(uri: &str) -> String {
         normalized.push_str(fragment);
     }
     normalized
+}
+
+fn normalize_mongo_uri_query_path(uri: &str) -> String {
+    let Some(rest_start) = uri.find("://").map(|idx| idx + "://".len()) else {
+        return uri.to_string();
+    };
+    if !uri[..rest_start].eq_ignore_ascii_case("mongodb://")
+        && !uri[..rest_start].eq_ignore_ascii_case("mongodb+srv://")
+    {
+        return uri.to_string();
+    }
+    let rest = &uri[rest_start..];
+    let Some(first_path_or_query) = rest.find(['/', '?', '#']) else {
+        return uri.to_string();
+    };
+    if rest.as_bytes()[first_path_or_query] != b'?' {
+        return uri.to_string();
+    }
+    let insert_at = rest_start + first_path_or_query;
+    format!("{}/{}", &uri[..insert_at], &uri[insert_at..])
 }
 
 fn mongo_uri_has_multiple_seeds(uri: &str) -> bool {
@@ -1572,6 +1622,7 @@ mod tests {
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
             redis_key_separator: default_redis_key_separator(),
+            redis_scan_page_size: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -2121,10 +2172,40 @@ mod tests {
     }
 
     #[test]
-    fn mongodb_form_url_without_params_does_not_force_topology_or_auth() {
+    fn mongodb_form_url_without_params_defaults_auth_source_to_admin() {
         let config = mongodb_config("root", "secret", Some("admin"));
 
-        assert_eq!(config.connection_url(), "mongodb://root:secret@10.1.2.3:17000/admin");
+        assert_eq!(config.connection_url(), "mongodb://root:secret@10.1.2.3:17000/admin?authSource=admin");
+    }
+
+    #[test]
+    fn mongodb_form_url_default_database_does_not_change_auth_source() {
+        let config = mongodb_config("root", "secret", Some("app"));
+
+        assert_eq!(config.connection_url(), "mongodb://root:secret@10.1.2.3:17000/app?authSource=admin");
+    }
+
+    #[test]
+    fn mongodb_form_url_without_database_keeps_slash_before_params() {
+        let config = mongodb_config("root", "secret", None);
+
+        assert_eq!(config.connection_url(), "mongodb://root:secret@10.1.2.3:17000/?authSource=admin");
+        assert_eq!(config.redacted_connection_url(), "mongodb://10.1.2.3:17000/?authSource=admin");
+    }
+
+    #[test]
+    fn mongodb_form_url_without_username_does_not_default_auth_source() {
+        let config = mongodb_config("", "", Some("app"));
+
+        assert_eq!(config.connection_url(), "mongodb://10.1.2.3:17000/app");
+    }
+
+    #[test]
+    fn mongodb_form_url_preserves_explicit_auth_source() {
+        let mut config = mongodb_config("root", "secret", Some("app"));
+        config.url_params = Some("authSource=app".to_string());
+
+        assert_eq!(config.connection_url(), "mongodb://root:secret@10.1.2.3:17000/app?authSource=app");
     }
 
     #[test]
@@ -2212,8 +2293,8 @@ mod tests {
         let mut config = mongodb_config("root", "secret", Some("admin"));
         config.ssl = true;
 
-        assert_eq!(config.connection_url(), "mongodb://root:secret@10.1.2.3:17000/admin?tls=true");
-        assert_eq!(config.redacted_connection_url(), "mongodb://10.1.2.3:17000/admin?tls=true");
+        assert_eq!(config.connection_url(), "mongodb://root:secret@10.1.2.3:17000/admin?tls=true&authSource=admin");
+        assert_eq!(config.redacted_connection_url(), "mongodb://10.1.2.3:17000/admin?tls=true&authSource=admin");
     }
 
     #[test]
@@ -2282,6 +2363,26 @@ mod tests {
     }
 
     #[test]
+    fn mongodb_connection_string_without_database_keeps_slash_before_params() {
+        let mut config = mongodb_config("root", "secret", None);
+        config.connection_string = Some("mongodb://read:pass@host1:27017?authSource=admin".to_string());
+
+        let url = config.connection_url();
+
+        assert_eq!(url, "mongodb://read:pass@host1:27017/?authSource=admin");
+    }
+
+    #[test]
+    fn mongodb_connection_string_without_database_keeps_slash_when_tunneled() {
+        let mut config = mongodb_config("root", "secret", None);
+        config.connection_string = Some("mongodb://read:pass@host1:27017?authSource=admin".to_string());
+
+        let url = config.connection_url_with_host("127.0.0.1", 54321);
+
+        assert_eq!(url, "mongodb://read:pass@127.0.0.1:54321/?authSource=admin&directConnection=true");
+    }
+
+    #[test]
     fn mongodb_multi_seed_connection_string_removes_direct_connection_true() {
         let mut config = mongodb_config("root", "secret", Some("admin"));
         config.connection_string = Some(
@@ -2316,6 +2417,15 @@ mod tests {
             url,
             "mongodb://root:secret@127.0.0.1:54321/admin?replicaSet=rs0&authSource=admin&directConnection=true"
         );
+    }
+
+    #[test]
+    fn mongodb_form_url_without_database_keeps_slash_before_tunneled_params() {
+        let config = mongodb_config("root", "secret", None);
+
+        let url = config.connection_url_with_host("127.0.0.1", 54321);
+
+        assert_eq!(url, "mongodb://root:secret@127.0.0.1:54321/?authSource=admin&directConnection=true");
     }
 
     #[test]

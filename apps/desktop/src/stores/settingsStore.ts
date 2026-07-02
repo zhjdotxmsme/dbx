@@ -13,7 +13,7 @@ import { setDebugLoggingEnabled } from "@/lib/debugLog";
 import { DEFAULT_TABLE_COLUMN_TEMPLATE_FIELDS, normalizeTableColumnTemplateFields } from "@/lib/tableColumnTemplates";
 
 export type AiProvider = "claude" | "openai" | "gemini" | "deepseek" | "qwen" | "ollama" | "openai-compatible" | "codex-cli" | "custom";
-export type AiApiStyle = "completions" | "responses";
+export type AiApiStyle = "completions" | "responses" | "anthropic-messages";
 export type AiAuthMethod = "api-key" | "bearer";
 export type AiReasoningLevel = "default" | "minimal" | "low" | "medium" | "high";
 
@@ -30,6 +30,7 @@ export interface AiConfig {
   reasoningLevel?: AiReasoningLevel;
   contextWindow?: number;
   codexCliPath?: string | null;
+  codexCliEnv?: Record<string, string>;
 }
 
 export interface AiTestConnectionResult {
@@ -56,6 +57,8 @@ export interface DesktopSettings {
 export type DesktopIconTheme = "default" | "black";
 
 export type InterfaceLayout = "separated" | "classic";
+
+export type UpdateDownloadSource = "official" | "cnb";
 
 export const DEFAULT_SIDEBAR_TABLE_PAGE_SIZE = 1000;
 
@@ -195,9 +198,21 @@ const defaultConfigs: Record<AiProvider, Omit<AiConfig, "apiKey">> = Object.from
 ) as Record<AiProvider, Omit<AiConfig, "apiKey">>;
 
 const AI_REASONING_LEVELS: AiReasoningLevel[] = ["default", "minimal", "low", "medium", "high"];
+const AI_ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 function normalizeAiReasoningLevel(value: unknown): AiReasoningLevel {
   return typeof value === "string" && AI_REASONING_LEVELS.includes(value as AiReasoningLevel) ? (value as AiReasoningLevel) : "default";
+}
+
+export function normalizeAiEnv(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const result: Record<string, string> = {};
+  for (const [rawKey, rawValue] of Object.entries(value as Record<string, unknown>)) {
+    const key = rawKey.trim();
+    if (!key || !AI_ENV_KEY_RE.test(key)) continue;
+    result[key] = rawValue == null ? "" : String(rawValue);
+  }
+  return result;
 }
 
 export function normalizeAiConfig(config: Partial<AiConfig> | null | undefined): AiConfig {
@@ -215,6 +230,7 @@ export function normalizeAiConfig(config: Partial<AiConfig> | null | undefined):
     reasoningLevel: normalizeAiReasoningLevel(config?.reasoningLevel),
     contextWindow: config?.contextWindow ?? undefined,
     codexCliPath: config?.codexCliPath?.trim() || undefined,
+    codexCliEnv: normalizeAiEnv(config?.codexCliEnv),
   };
 }
 
@@ -237,6 +253,9 @@ const CELL_DETAIL_PANEL_LAYOUTS = ["bottom", "right"] as const;
 export type CellDetailPanelLayout = (typeof CELL_DETAIL_PANEL_LAYOUTS)[number];
 const DATA_GRID_RENDER_MODES = ["dom", "canvas"] as const;
 export type DataGridRenderMode = (typeof DATA_GRID_RENDER_MODES)[number];
+export const TABLE_FONT_SIZE_MIN = 12;
+export const TABLE_FONT_SIZE_MAX = 16;
+export const TABLE_FONT_SIZE_DEFAULT = 13;
 const DISCONNECT_TAB_HANDLING_MODES = ["close-tabs", "keep-tabs-clear-results", "keep-tabs-keep-results"] as const;
 export type DisconnectTabHandlingMode = (typeof DISCONNECT_TAB_HANDLING_MODES)[number];
 
@@ -317,12 +336,13 @@ export interface EditorSettings {
   pageSize: number;
   infiniteScroll: boolean;
   infiniteScrollMaxRows: number;
-  redisScanPageSize: number;
   mongoViewMode: "document" | "table";
   showColumnCommentsInHeader: boolean;
   showColumnTypesInHeader: boolean;
   compactColumnHeaderActions: boolean;
+  dataGridQuickEntry: boolean;
   dataGridRenderMode: DataGridRenderMode;
+  tableFontSize: number;
   structureEditorDensity: StructureEditorDensity;
   tableInfoDrawerWidth: number;
   cellDetailDrawerWidth: number;
@@ -346,6 +366,7 @@ export interface EditorSettings {
   exportRowLimitEnabled: boolean;
   exportRowLimit: number;
   queryExportKeysetOptimizationEnabled: boolean;
+  updateDownloadSource: UpdateDownloadSource;
   toolbarItems: ToolbarItems;
 }
 
@@ -421,12 +442,13 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   pageSize: 100,
   infiniteScroll: false,
   infiniteScrollMaxRows: 5000,
-  redisScanPageSize: 1000,
   mongoViewMode: "document",
   showColumnCommentsInHeader: true,
   showColumnTypesInHeader: true,
   compactColumnHeaderActions: true,
+  dataGridQuickEntry: false,
   dataGridRenderMode: "canvas",
+  tableFontSize: TABLE_FONT_SIZE_DEFAULT,
   structureEditorDensity: "compact",
   tableInfoDrawerWidth: 320,
   cellDetailDrawerWidth: 380,
@@ -447,9 +469,10 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   snippets: DEFAULT_SQL_SNIPPETS,
   tableColumnTemplateFields: [...DEFAULT_TABLE_COLUMN_TEMPLATE_FIELDS],
   exportBatchSize: 2000,
-  exportRowLimitEnabled: true,
+  exportRowLimitEnabled: false,
   exportRowLimit: 100000,
   queryExportKeysetOptimizationEnabled: true,
+  updateDownloadSource: "official",
   toolbarItems: { ...DEFAULT_TOOLBAR_ITEMS },
 };
 
@@ -480,6 +503,15 @@ function normalizeCellDetailPanelLayout(value: unknown): CellDetailPanelLayout {
 
 function normalizeDataGridRenderMode(value: unknown): DataGridRenderMode {
   return DATA_GRID_RENDER_MODES.includes(value as DataGridRenderMode) ? (value as DataGridRenderMode) : DEFAULT_EDITOR_SETTINGS.dataGridRenderMode;
+}
+
+function normalizeTableFontSize(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return TABLE_FONT_SIZE_DEFAULT;
+  return Math.min(TABLE_FONT_SIZE_MAX, Math.max(TABLE_FONT_SIZE_MIN, Math.round(value)));
+}
+
+function normalizeUpdateDownloadSource(value: unknown): UpdateDownloadSource {
+  return value === "cnb" ? "cnb" : DEFAULT_EDITOR_SETTINGS.updateDownloadSource;
 }
 
 function normalizeDisconnectTabHandlingMode(value: unknown, legacyCloseTabsOnDisconnect?: unknown): DisconnectTabHandlingMode {
@@ -592,12 +624,13 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     pageSize: normalizeResultPageSize(settings.pageSize),
     infiniteScroll: settings.infiniteScroll ?? DEFAULT_EDITOR_SETTINGS.infiniteScroll,
     infiniteScrollMaxRows: typeof settings.infiniteScrollMaxRows === "number" && settings.infiniteScrollMaxRows >= 1000 && settings.infiniteScrollMaxRows <= 50000 ? Math.round(settings.infiniteScrollMaxRows) : DEFAULT_EDITOR_SETTINGS.infiniteScrollMaxRows,
-    redisScanPageSize: settings.redisScanPageSize ?? DEFAULT_EDITOR_SETTINGS.redisScanPageSize,
     mongoViewMode: settings.mongoViewMode === "table" ? "table" : DEFAULT_EDITOR_SETTINGS.mongoViewMode,
     showColumnCommentsInHeader: settings.showColumnCommentsInHeader ?? DEFAULT_EDITOR_SETTINGS.showColumnCommentsInHeader,
     showColumnTypesInHeader: settings.showColumnTypesInHeader ?? DEFAULT_EDITOR_SETTINGS.showColumnTypesInHeader,
     compactColumnHeaderActions: settings.compactColumnHeaderActions ?? DEFAULT_EDITOR_SETTINGS.compactColumnHeaderActions,
+    dataGridQuickEntry: settings.dataGridQuickEntry ?? DEFAULT_EDITOR_SETTINGS.dataGridQuickEntry,
     dataGridRenderMode: normalizeDataGridRenderMode(settings.dataGridRenderMode),
+    tableFontSize: normalizeTableFontSize(settings.tableFontSize),
     structureEditorDensity: normalizeStructureEditorDensity(settings.structureEditorDensity),
     tableInfoDrawerWidth: normalizeDrawerWidth(settings.tableInfoDrawerWidth, 240, DEFAULT_EDITOR_SETTINGS.tableInfoDrawerWidth),
     cellDetailDrawerWidth: normalizeDrawerWidth(settings.cellDetailDrawerWidth, 260, DEFAULT_EDITOR_SETTINGS.cellDetailDrawerWidth),
@@ -621,6 +654,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     exportRowLimitEnabled: typeof settings.exportRowLimitEnabled === "boolean" ? settings.exportRowLimitEnabled : DEFAULT_EDITOR_SETTINGS.exportRowLimitEnabled,
     exportRowLimit: typeof settings.exportRowLimit === "number" && settings.exportRowLimit >= 100 && settings.exportRowLimit <= 2147483647 ? Math.round(settings.exportRowLimit) : DEFAULT_EDITOR_SETTINGS.exportRowLimit,
     queryExportKeysetOptimizationEnabled: typeof settings.queryExportKeysetOptimizationEnabled === "boolean" ? settings.queryExportKeysetOptimizationEnabled : DEFAULT_EDITOR_SETTINGS.queryExportKeysetOptimizationEnabled,
+    updateDownloadSource: normalizeUpdateDownloadSource(settings.updateDownloadSource),
     toolbarItems: normalizeToolbarItems(settings.toolbarItems),
   };
 }
@@ -764,12 +798,13 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.infiniteScroll !== undefined) editorSettings.value.infiniteScroll = partial.infiniteScroll;
     if (partial.infiniteScrollMaxRows !== undefined)
       editorSettings.value.infiniteScrollMaxRows = typeof partial.infiniteScrollMaxRows === "number" && partial.infiniteScrollMaxRows >= 1000 && partial.infiniteScrollMaxRows <= 50000 ? Math.round(partial.infiniteScrollMaxRows) : DEFAULT_EDITOR_SETTINGS.infiniteScrollMaxRows;
-    if (partial.redisScanPageSize !== undefined) editorSettings.value.redisScanPageSize = partial.redisScanPageSize;
     if (partial.mongoViewMode !== undefined) editorSettings.value.mongoViewMode = partial.mongoViewMode;
     if (partial.showColumnCommentsInHeader !== undefined) editorSettings.value.showColumnCommentsInHeader = partial.showColumnCommentsInHeader;
     if (partial.showColumnTypesInHeader !== undefined) editorSettings.value.showColumnTypesInHeader = partial.showColumnTypesInHeader;
     if (partial.compactColumnHeaderActions !== undefined) editorSettings.value.compactColumnHeaderActions = partial.compactColumnHeaderActions;
+    if (partial.dataGridQuickEntry !== undefined) editorSettings.value.dataGridQuickEntry = partial.dataGridQuickEntry;
     if (partial.dataGridRenderMode !== undefined) editorSettings.value.dataGridRenderMode = normalizeDataGridRenderMode(partial.dataGridRenderMode);
+    if (partial.tableFontSize !== undefined) editorSettings.value.tableFontSize = normalizeTableFontSize(partial.tableFontSize);
     if (partial.structureEditorDensity !== undefined) editorSettings.value.structureEditorDensity = normalizeStructureEditorDensity(partial.structureEditorDensity);
     if (partial.tableInfoDrawerWidth !== undefined) editorSettings.value.tableInfoDrawerWidth = normalizeDrawerWidth(partial.tableInfoDrawerWidth, 240, DEFAULT_EDITOR_SETTINGS.tableInfoDrawerWidth);
     if (partial.cellDetailDrawerWidth !== undefined) editorSettings.value.cellDetailDrawerWidth = normalizeDrawerWidth(partial.cellDetailDrawerWidth, 260, DEFAULT_EDITOR_SETTINGS.cellDetailDrawerWidth);
@@ -793,6 +828,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.exportRowLimitEnabled !== undefined) editorSettings.value.exportRowLimitEnabled = partial.exportRowLimitEnabled;
     if (partial.exportRowLimit !== undefined) editorSettings.value.exportRowLimit = Math.min(2147483647, Math.max(100, Math.round(partial.exportRowLimit)));
     if (partial.queryExportKeysetOptimizationEnabled !== undefined) editorSettings.value.queryExportKeysetOptimizationEnabled = partial.queryExportKeysetOptimizationEnabled;
+    if (partial.updateDownloadSource !== undefined) editorSettings.value.updateDownloadSource = normalizeUpdateDownloadSource(partial.updateDownloadSource);
     if (partial.toolbarItems !== undefined) editorSettings.value.toolbarItems = normalizeToolbarItems(partial.toolbarItems);
     saveEditorSettings(editorSettings.value);
   }

@@ -5,9 +5,9 @@ import { buildObjectBrowserRows, filterObjectBrowserRows, formatObjectBrowserByt
 test("builds unique row ids for overloaded routines with the same visible name", () => {
   const rows = buildObjectBrowserRows({
     objects: [
-      { name: "list_pipes", object_type: "FUNCTION", schema: "dbms_pipe" },
-      { name: "list_pipes", object_type: "FUNCTION", schema: "dbms_pipe" },
-      { name: "create_pipe", object_type: "FUNCTION", schema: "dbms_pipe" },
+      { name: "list_pipes", object_type: "FUNCTION", schema: "dbms_pipe", signature: "" },
+      { name: "list_pipes", object_type: "FUNCTION", schema: "dbms_pipe", signature: "name text" },
+      { name: "create_pipe", object_type: "FUNCTION", schema: "dbms_pipe", signature: "" },
     ],
     database: "highgo",
     fallbackSchema: "dbms_pipe",
@@ -16,7 +16,33 @@ test("builds unique row ids for overloaded routines with the same visible name",
 
   assert.deepEqual(
     rows.map((row) => row.id),
-    ["dbms_pipe:list_pipes:FUNCTION:0", "dbms_pipe:list_pipes:FUNCTION:1", "dbms_pipe:create_pipe:FUNCTION:0"],
+    ["dbms_pipe:list_pipes:FUNCTION::0", "dbms_pipe:list_pipes:FUNCTION:name text:0", "dbms_pipe:create_pipe:FUNCTION::0"],
+  );
+  assert.deepEqual(
+    rows.map((row) => row.displayName),
+    ["list_pipes()", "list_pipes(name text)", "create_pipe()"],
+  );
+  assert.deepEqual(
+    rows.map((row) => row.name),
+    ["list_pipes", "list_pipes", "create_pipe"],
+  );
+});
+
+test("object browser search matches routine signatures", () => {
+  const rows = buildObjectBrowserRows({
+    objects: [
+      { name: "refresh_stats", object_type: "PROCEDURE", schema: "public", signature: "target_table text" },
+      { name: "refresh_stats", object_type: "PROCEDURE", schema: "public", signature: "" },
+      { name: "orders", object_type: "TABLE", schema: "public" },
+    ],
+    database: "app",
+    fallbackSchema: "public",
+    needsSchema: true,
+  });
+
+  assert.deepEqual(
+    filterObjectBrowserRows(rows, "target_table").map((row) => row.displayName),
+    ["refresh_stats(target_table text)"],
   );
 });
 
@@ -51,6 +77,20 @@ test("object browser rows normalize PostgreSQL sequence objects", () => {
   assert.deepEqual(
     rows.map((row) => ({ id: row.id, type: row.type })),
     [{ id: "public:order_id_seq:SEQUENCE:0", type: "SEQUENCE" }],
+  );
+});
+
+test("object browser rows normalize space separated materialized views", () => {
+  const rows = buildObjectBrowserRows({
+    objects: [{ name: "user_summary_mv", object_type: "MATERIALIZED VIEW", schema: "APP" }],
+    database: "dameng",
+    fallbackSchema: "APP",
+    needsSchema: true,
+  });
+
+  assert.deepEqual(
+    rows.map((row) => ({ id: row.id, type: row.type })),
+    [{ id: "APP:user_summary_mv:MATERIALIZED_VIEW:0", type: "MATERIALIZED_VIEW" }],
   );
 });
 
