@@ -212,6 +212,8 @@ pub struct AiConversation {
     pub messages: Vec<AiChatMessage>,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub user_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -15,6 +15,8 @@ pub struct SavedSqlFolder {
     pub order_index: i64,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub user_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +38,8 @@ pub struct SavedSqlFile {
     pub opened_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub user_id: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

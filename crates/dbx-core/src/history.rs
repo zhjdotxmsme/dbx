@@ -25,6 +25,8 @@ pub struct HistoryEntry {
     pub rollback_sql: Option<String>,
     #[serde(default)]
     pub details_json: Option<String>,
+    #[serde(default)]
+    pub user_id: String,
 }
 
 pub const MAX_HISTORY: usize = 1000;

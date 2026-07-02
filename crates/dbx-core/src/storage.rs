@@ -191,7 +191,8 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         target TEXT NOT NULL DEFAULT '',
         affected_rows INTEGER,
         rollback_sql TEXT,
-        details_json TEXT
+        details_json TEXT,
+        user_id TEXT NOT NULL DEFAULT ''
     )",
     "CREATE TABLE IF NOT EXISTS ai_config (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -204,7 +205,8 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         database TEXT NOT NULL DEFAULT '',
         messages_json TEXT NOT NULL DEFAULT '[]',
         created_at TEXT NOT NULL DEFAULT '',
-        updated_at TEXT NOT NULL DEFAULT ''
+        updated_at TEXT NOT NULL DEFAULT '',
+        user_id TEXT NOT NULL DEFAULT ''
     )",
     "CREATE TABLE IF NOT EXISTS sidebar_layout (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -250,7 +252,8 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         name TEXT NOT NULL DEFAULT '',
         order_index INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL DEFAULT '',
-        updated_at TEXT NOT NULL DEFAULT ''
+        updated_at TEXT NOT NULL DEFAULT '',
+        user_id TEXT NOT NULL DEFAULT ''
     )",
     "CREATE TABLE IF NOT EXISTS saved_sql_files (
         id TEXT PRIMARY KEY,
@@ -264,7 +267,8 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         open_count INTEGER NOT NULL DEFAULT 0,
         opened_at TEXT,
         created_at TEXT NOT NULL DEFAULT '',
-        updated_at TEXT NOT NULL DEFAULT ''
+        updated_at TEXT NOT NULL DEFAULT '',
+        user_id TEXT NOT NULL DEFAULT ''
     )",
 ];
 
@@ -284,6 +288,7 @@ impl Storage {
             }
             ensure_history_columns_sync(conn)?;
             ensure_saved_sql_columns_sync(conn)?;
+            ensure_user_id_columns_sync(conn)?;
             Ok(())
         })
     }
@@ -394,6 +399,14 @@ fn ensure_saved_sql_columns_sync(conn: &Connection) -> Result<(), String> {
 
     ensure_table_columns(conn, "saved_sql_folders", FOLDER_COLUMNS)?;
     ensure_table_columns(conn, "saved_sql_files", FILE_COLUMNS)?;
+    Ok(())
+}
+
+fn ensure_user_id_columns_sync(conn: &Connection) -> Result<(), String> {
+    const USER_ID_COL: (&str, &str) = ("user_id", "TEXT NOT NULL DEFAULT ''");
+    for table in &["history", "ai_conversations", "saved_sql_folders", "saved_sql_files"] {
+        ensure_table_columns(conn, table, &[USER_ID_COL])?;
+    }
     Ok(())
 }
 
